@@ -688,7 +688,7 @@ class DCFModel:
 @app.route('/')
 def index():
     """Render main page"""
-    return render_template('index_enhanced.html')
+    return render_template('index_input.html')
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze_ticker():
