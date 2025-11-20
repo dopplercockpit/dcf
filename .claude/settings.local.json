@@ -6,7 +6,9 @@
       "Bash(findstr:*)",
       "Bash(tasklist:*)",
       "Bash(dir:*)",
-      "Bash(netstat:*)"
+      "Bash(netstat:*)",
+      "Bash(.venvScriptspip install yfinance)",
+      "Bash(c:\\active_projects\\dcf\\.venv\\Scripts\\pip.exe install:*)"
     ],
     "deny": [],
     "ask": []

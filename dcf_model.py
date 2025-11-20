@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced Universal DCF Model with Multi-Source Data and Qualitative Analysis
-Now with Reddit sentiment, news integration, and comprehensive transparency
+FIXED: Now properly fetches Balance Sheet data and validates data quality
 """
 
 from flask import Flask, render_template, jsonify, request
@@ -13,6 +13,7 @@ import requests
 from dotenv import load_dotenv
 import re
 from collections import Counter
+import yfinance as yf
 
 # Load environment variables
 load_dotenv()
@@ -22,16 +23,104 @@ CORS(app)
 
 # API Configuration
 ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
-NEWS_API_KEY = os.environ.get("NEWS_API_KEY")  # Get free key from newsapi.org
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY")
+
+# --- DATA QUALITY CHECKER ---
+class DataQualityChecker:
+    """
+    Validates financial data quality and flags issues.
+    Like a health inspector for your financial data!
+    """
+    
+    @staticmethod
+    def check_company_data(company_data):
+        """Check if company data has critical fields"""
+        issues = []
+        warnings = []
+        
+        # Critical checks (would break DCF)
+        if company_data.get('shares_outstanding', 0) <= 0:
+            issues.append("❌ Missing shares outstanding - cannot calculate per-share value")
+        
+        if company_data.get('current_stock_price', 0) <= 0:
+            issues.append("❌ Missing current stock price - cannot determine market value")
+        
+        # Important checks (affects accuracy)
+        if company_data.get('total_debt', 0) == 0 and company_data.get('cash', 0) == 0:
+            warnings.append("⚠️ Both debt and cash are zero - check if balance sheet data loaded")
+        
+        if company_data.get('cash', 0) < 0:
+            warnings.append("⚠️ Negative cash balance detected - data may be incorrect")
+        
+        if company_data.get('total_debt', 0) < 0:
+            warnings.append("⚠️ Negative debt detected - data may be incorrect")
+        
+        return issues, warnings
+    
+    @staticmethod
+    def check_historical_data(historical_data):
+        """Check if historical cash flow data is complete"""
+        issues = []
+        warnings = []
+        
+        quarters = historical_data.get('quarters', [])
+        ocf = historical_data.get('operating_cash_flow', [])
+        capex = historical_data.get('capex', [])
+        
+        if len(quarters) < 4:
+            issues.append(f"❌ Only {len(quarters)} quarters of data (need at least 4 for TTM)")
+        
+        if len(ocf) == 0:
+            issues.append("❌ No operating cash flow data")
+        
+        if len(capex) == 0:
+            warnings.append("⚠️ No CapEx data - FCF calculation will be incomplete")
+        
+        # Check for all-zero data
+        if all(x == 0 for x in ocf):
+            issues.append("❌ All operating cash flow values are zero")
+        
+        if all(x == 0 for x in capex):
+            warnings.append("⚠️ All CapEx values are zero - unusual for most companies")
+        
+        return issues, warnings
+    
+    @staticmethod
+    def get_data_quality_report(company_data, historical_data):
+        """Generate comprehensive data quality report"""
+        company_issues, company_warnings = DataQualityChecker.check_company_data(company_data)
+        hist_issues, hist_warnings = DataQualityChecker.check_historical_data(historical_data)
+        
+        all_issues = company_issues + hist_issues
+        all_warnings = company_warnings + hist_warnings
+        
+        # Determine overall quality
+        if len(all_issues) > 0:
+            quality = "POOR"
+            quality_emoji = "🔴"
+        elif len(all_warnings) > 2:
+            quality = "FAIR"
+            quality_emoji = "🟡"
+        elif len(all_warnings) > 0:
+            quality = "GOOD"
+            quality_emoji = "🟢"
+        else:
+            quality = "EXCELLENT"
+            quality_emoji = "✅"
+        
+        return {
+            'quality': quality,
+            'quality_emoji': quality_emoji,
+            'issues': all_issues,
+            'warnings': all_warnings,
+            'usable': len(all_issues) == 0
+        }
+
 
 # --- REDDIT SCRAPER (No Authentication Required!) ---
-# Think of this as eavesdropping on the financial watercooler - 
-# we're listening to what retail investors are saying without needing a Reddit account
-
 class RedditScraper:
     """
     Scrapes Reddit without authentication using the public JSON API.
-    It's like reading a newspaper that's freely available on the street corner!
     """
     
     BASE_URL = "https://www.reddit.com"
@@ -42,26 +131,22 @@ class RedditScraper:
         }
     
     def search_ticker_mentions(self, ticker, limit=50):
-        """
-        Search multiple finance subreddits for ticker mentions.
-        We cast a wide net across the financial fishing holes of Reddit.
-        """
+        """Search multiple finance subreddits for ticker mentions."""
         subreddits = ['stocks', 'investing', 'wallstreetbets', 'StockMarket', 'valueinvesting']
         all_posts = []
         
         for subreddit in subreddits:
             try:
-                # Reddit's JSON API is publicly accessible - just add .json to the URL!
                 url = f"{self.BASE_URL}/r/{subreddit}/search.json"
                 params = {
                     'q': ticker,
-                    'limit': limit // len(subreddits),  # Distribute our quota across subreddits
+                    'limit': limit // len(subreddits),
                     'restrict_sr': 'true',
                     'sort': 'relevance',
-                    't': 'month'  # Last month of posts
+                    't': 'month'
                 }
                 
-                response = requests.get(url, headers=self.headers, params=params, timeout=10)
+                response = requests.get(url, headers=self.headers, params=params, timeout=30)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -86,22 +171,14 @@ class RedditScraper:
         return all_posts
     
     def analyze_sentiment(self, posts, ticker):
-        """
-        Analyze sentiment from Reddit posts using keyword analysis.
-        This is like reading the room - are people excited or worried?
+        """Analyze sentiment from Reddit posts using keyword analysis."""
         
-        We use a simple but effective approach: count positive vs negative words.
-        Think of it as a tug-of-war between bulls and bears!
-        """
-        
-        # Positive indicators (bulls are charging!)
         positive_words = [
             'buy', 'bullish', 'moon', 'rocket', 'gains', 'calls', 'long',
             'undervalued', 'opportunity', 'growth', 'breakout', 'strong',
             'upgrade', 'beat', 'positive', 'profit', 'revenue', 'innovation'
         ]
         
-        # Negative indicators (bears are growling!)
         negative_words = [
             'sell', 'bearish', 'puts', 'short', 'overvalued', 'dump',
             'crash', 'red', 'losses', 'weak', 'downgrade', 'miss',
@@ -115,19 +192,15 @@ class RedditScraper:
         for post in posts:
             text = (post['title'] + ' ' + post['text']).lower()
             
-            # Count sentiment words
             pos_count = sum(1 for word in positive_words if word in text)
             neg_count = sum(1 for word in negative_words if word in text)
             
-            # Weight by post engagement (more upvotes = more important opinion)
-            weight = 1 + (post['score'] / 100)  # Logarithmic-ish scaling
+            weight = 1 + (post['score'] / 100)
             
             if pos_count > 0 or neg_count > 0:
-                # Calculate sentiment score (-1 to 1, like a seesaw)
                 score = ((pos_count - neg_count) / (pos_count + neg_count)) * weight
                 sentiment_scores.append(score)
                 
-                # Track which keywords appear most
                 for word in positive_words:
                     if word in text:
                         keyword_frequency[f"📈 {word}"] += 1
@@ -135,7 +208,6 @@ class RedditScraper:
                     if word in text:
                         keyword_frequency[f"📉 {word}"] += 1
                 
-                # Save interesting posts (high engagement or strong sentiment)
                 if post['score'] > 50 or abs(score) > 0.5:
                     post_highlights.append({
                         'title': post['title'][:100],
@@ -145,10 +217,8 @@ class RedditScraper:
                         'subreddit': post['subreddit']
                     })
         
-        # Calculate overall sentiment
         if sentiment_scores:
             avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
-            # Convert to percentage (0-100 scale is easier to understand)
             sentiment_percentage = (avg_sentiment + 1) / 2 * 100
         else:
             avg_sentiment = 0
@@ -168,123 +238,54 @@ class RedditScraper:
 
 # --- NEWS API INTEGRATION ---
 class NewsAnalyzer:
-    """
-    Fetches and analyzes recent news about a company.
-    This is our window into the real world - what's happening beyond the numbers?
-    """
+    """Fetches and analyzes recent news about a company."""
     
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "https://newsapi.org/v2/everything"
     
-    def fetch_company_and_cashflows(ticker: str):
-        """
-        Fetch company snapshot + last 12 quarters of CF data from Alpha Vantage.
-        Updated to include BALANCE_SHEET for accurate Cash and Debt figures.
-        """
-        ticker = ticker.upper().strip()
-
-        # 1) Company overview (fundamentals: name, shares, beta, etc.)
-        overview = _call_alpha_vantage({
-            "function": "OVERVIEW",
-            "symbol": ticker
-        })
-
-        # 2) Real-time / latest quote for current price
-        quote = _call_alpha_vantage({
-            "function": "GLOBAL_QUOTE",
-            "symbol": ticker
-        })
-
-        # 3) Cash flow statement (quarterly)
-        cash_flow = _call_alpha_vantage({
-            "function": "CASH_FLOW",
-            "symbol": ticker
-        })
-
-        # 4) Balance Sheet (NEW: Required for Cash and Debt!)
-        balance_sheet = _call_alpha_vantage({
-            "function": "BALANCE_SHEET",
-            "symbol": ticker
-        })
-
-        # ---- company_data for your model ----
-        def _to_millions(value):
-            try:
-                if value is None or value == 'None': return 0.0
-                return float(value) / 1_000_000
-            except (TypeError, ValueError):
-                return 0.0
-
-        try:
-            price_str = quote["Global Quote"]["05. price"]
-            current_price = float(price_str)
-        except Exception:
-            current_price = 0.0
-
-        # Extract Cash and Debt from the most recent quarterly report
-        # Alpha Vantage reports are usually sorted newest to oldest, but we grab index 0 to be safe
-        bs_reports = balance_sheet.get("quarterlyReports", [])
-        latest_bs = bs_reports[0] if bs_reports else {}
-
-        # Try multiple keys for Total Debt as API naming can vary
-        raw_debt = latest_bs.get("shortLongTermDebtTotal") or latest_bs.get("totalDebt") or "0"
-
-        # Try multiple keys for Cash
-        raw_cash = latest_bs.get("cashAndCashEquivalentsAtCarryingValue") or latest_bs.get("cashAndShortTermInvestments") or "0"
-
-        company_data = {
-            "ticker": ticker,
-            "company_name": overview.get("Name", ticker),
-            "current_stock_price": current_price,
-            "shares_outstanding": _to_millions(overview.get("SharesOutstanding")),
-            "total_debt": _to_millions(raw_debt),
-            "cash": _to_millions(raw_cash),
-        }
-
-        # ---- historical_data (quarters, ocf, capex, net income) ----
-        quarterly_reports = cash_flow.get("quarterlyReports", [])
-
-        # Alpha Vantage returns most recent first → reverse to get chronological
-        quarterly_reports = list(quarterly_reports)[:12]
-        quarterly_reports.reverse()
-
-        quarters = []
-        operating_cf = []
-        capex = []
-        net_income = []
-
-        for r in quarterly_reports:
-            date = r.get("fiscalDateEnding")  # e.g. "2024-09-30"
-            quarters.append(date or "N/A")
-
-            operating_cf.append(_to_millions(r.get("operatingCashflow")))
-            capex.append(_to_millions(r.get("capitalExpenditures")))
-            net_income.append(_to_millions(r.get("netIncome")))
-
-        historical_data = {
-            "quarters": quarters,
-            "operating_cash_flow": operating_cf,
-            "capex": capex,
-            "net_income": net_income,
-        }
-
-        # Optional: hints for model assumptions (e.g. beta)
-        assumptions_hint = {}
-        try:
-            assumptions_hint["beta"] = float(overview.get("Beta"))
-        except (TypeError, ValueError):
-            pass
-
-        return company_data, historical_data, assumptions_hint
-
-    def analyze_news_sentiment(self, articles):
-        """
-        Analyze news sentiment - are journalists painting a rosy or gloomy picture?
-        This is like reading between the lines of business journalism.
-        """
+    def fetch_company_news(self, company_name, ticker, days=30):
+        """Fetch recent news articles about the company."""
+        if not self.api_key:
+            return []
         
-        # Keywords that signal trouble (storm clouds gathering!)
+        try:
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=days)
+            
+            params = {
+                'q': f'"{company_name}" OR {ticker}',
+                'apiKey': self.api_key,
+                'language': 'en',
+                'sortBy': 'publishedAt',
+                'from': from_date.strftime('%Y-%m-%d'),
+                'to': to_date.strftime('%Y-%m-%d'),
+                'pageSize': 50
+            }
+            
+            response = requests.get(self.base_url, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                articles = data.get('articles', [])
+                
+                return [{
+                    'title': article['title'],
+                    'description': article.get('description', ''),
+                    'url': article['url'],
+                    'source': article['source']['name'],
+                    'published_at': article['publishedAt'],
+                    'content': article.get('content', '')
+                } for article in articles]
+            
+        except Exception as e:
+            print(f"Error fetching news: {e}")
+        
+        return []
+    
+    def analyze_news_sentiment(self, articles):
+        """Analyze news sentiment."""
+        
         negative_keywords = [
             'lawsuit', 'investigation', 'decline', 'loss', 'scandal',
             'controversy', 'warning', 'risk', 'concern', 'pressure',
@@ -292,7 +293,6 @@ class NewsAnalyzer:
             'downgrade', 'disappointing', 'weak', 'struggle', 'plunge'
         ]
         
-        # Keywords that signal opportunity (sun breaking through!)
         positive_keywords = [
             'growth', 'profit', 'innovation', 'expansion', 'partnership',
             'acquisition', 'upgrade', 'breakthrough', 'record', 'strong',
@@ -314,7 +314,6 @@ class NewsAnalyzer:
                 score = (pos_count - neg_count) / (pos_count + neg_count)
                 sentiment_scores.append(score)
                 
-                # Flag significant news (the stuff that really matters!)
                 if neg_count >= 2:
                     risk_flags.append({
                         'title': article['title'][:100],
@@ -339,12 +338,12 @@ class NewsAnalyzer:
             'sentiment_percentage': sentiment_percentage,
             'total_articles': len(articles),
             'analyzed_articles': len(sentiment_scores),
-            'risk_flags': risk_flags[:5],  # Top 5 risks
-            'opportunity_flags': opportunity_flags[:5]  # Top 5 opportunities
+            'risk_flags': risk_flags[:5],
+            'opportunity_flags': opportunity_flags[:5]
         }
 
 
-# --- ALPHA VANTAGE FETCHER (Your existing code, enhanced) ---
+# --- ALPHA VANTAGE FETCHER (FIXED!) ---
 def _call_alpha_vantage(params: dict):
     """Low-level Alpha Vantage call with basic error handling."""
     if not ALPHAVANTAGE_API_KEY:
@@ -353,7 +352,7 @@ def _call_alpha_vantage(params: dict):
     query = dict(params)
     query["apikey"] = ALPHAVANTAGE_API_KEY
     
-    resp = requests.get("https://www.alphavantage.co/query", params=query, timeout=10)
+    resp = requests.get("https://www.alphavantage.co/query", params=query, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     
@@ -365,57 +364,236 @@ def _call_alpha_vantage(params: dict):
     return data
 
 
-def fetch_company_and_cashflows(ticker: str):
+def fetch_from_yahoo(ticker: str):
     """
-    Fetch company snapshot + last 12 quarters of CF data from Alpha Vantage.
-    This is our primary data source - think of it as the company's report card.
+    Fallback: Fetch company data from Yahoo Finance using yfinance.
     """
     ticker = ticker.upper().strip()
-    
-    # 1) Company overview (the company's vital statistics)
-    overview = _call_alpha_vantage({
-        "function": "OVERVIEW",
-        "symbol": ticker
-    })
-    
-    # 2) Real-time quote (what's it trading for RIGHT NOW?)
-    quote = _call_alpha_vantage({
-        "function": "GLOBAL_QUOTE",
-        "symbol": ticker
-    })
-    
-    # 3) Cash flow statement (the money trail - where's it coming from and going to?)
-    cash_flow = _call_alpha_vantage({
-        "function": "CASH_FLOW",
-        "symbol": ticker
-    })
+    print(f"  📊 Fetching data from Yahoo Finance...")
+
+    stock = yf.Ticker(ticker)
+    info = stock.info
+
+    def _to_millions(value):
+        """Convert absolute USD to millions"""
+        try:
+            if value is None:
+                return 0.0
+            return float(value) / 1_000_000
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Get current price
+    current_price = info.get('currentPrice') or info.get('regularMarketPrice') or 0.0
+
+    # Company data from info
+    company_data = {
+        "ticker": ticker,
+        "company_name": info.get("longName") or info.get("shortName") or ticker,
+        "current_stock_price": current_price,
+        "shares_outstanding": _to_millions(info.get("sharesOutstanding")),
+        "total_debt": _to_millions(info.get("totalDebt")),
+        "short_term_debt": _to_millions(info.get("currentDebt", 0)),
+        "long_term_debt": _to_millions(info.get("longTermDebt", 0)),
+        "cash": _to_millions(info.get("totalCash")),
+        "total_assets": _to_millions(info.get("totalAssets", 0)),
+        "total_liabilities": _to_millions(info.get("totalDebt", 0)),  # Approximation
+        "shareholders_equity": _to_millions(info.get("bookValue", 0) * info.get("sharesOutstanding", 0)),
+    }
+
+    # Get quarterly cash flow data
+    try:
+        cf = stock.quarterly_cashflow
+        if cf is not None and not cf.empty:
+            # Get up to 12 quarters
+            cf = cf.iloc[:, :12]
+
+            quarters = []
+            operating_cf = []
+            capex = []
+            net_income = []
+
+            for col in cf.columns:
+                quarters.append(col.strftime('%Y-%m-%d'))
+
+                # Operating cash flow
+                ocf = 0.0
+                for key in ['Operating Cash Flow', 'Total Cash From Operating Activities']:
+                    if key in cf.index:
+                        ocf = _to_millions(cf.loc[key, col])
+                        break
+                operating_cf.append(ocf)
+
+                # CapEx
+                capex_val = 0.0
+                for key in ['Capital Expenditure', 'Capital Expenditures']:
+                    if key in cf.index:
+                        capex_val = abs(_to_millions(cf.loc[key, col]))
+                        break
+                capex.append(capex_val)
+
+                # Net income
+                ni = 0.0
+                if 'Net Income' in cf.index:
+                    ni = _to_millions(cf.loc['Net Income', col])
+                net_income.append(ni)
+
+            # Reverse to chronological order
+            quarters.reverse()
+            operating_cf.reverse()
+            capex.reverse()
+            net_income.reverse()
+        else:
+            quarters = []
+            operating_cf = []
+            capex = []
+            net_income = []
+    except Exception as e:
+        print(f"  ⚠️ Could not fetch cash flow data: {e}")
+        quarters = []
+        operating_cf = []
+        capex = []
+        net_income = []
+
+    historical_data = {
+        "quarters": quarters,
+        "operating_cash_flow": operating_cf,
+        "capex": capex,
+        "net_income": net_income,
+    }
+
+    assumptions_hint = {}
+    beta = info.get("beta")
+    if beta:
+        assumptions_hint["beta"] = float(beta)
+
+    raw_financials = {
+        "balance_sheet_date": "Yahoo Finance",
+        "raw_data": {},
+        "source": "Yahoo Finance (yfinance)"
+    }
+
+    return company_data, historical_data, assumptions_hint, raw_financials
+
+
+def fetch_company_and_cashflows(ticker: str):
+    """
+    Fetch company snapshot + cash flows + BALANCE SHEET data.
+    Tries Alpha Vantage first, falls back to Yahoo Finance.
+    """
+    ticker = ticker.upper().strip()
+
+    # Try Alpha Vantage first
+    if ALPHAVANTAGE_API_KEY:
+        try:
+            import time
+
+            print(f"  📊 Fetching OVERVIEW...")
+            overview = _call_alpha_vantage({
+                "function": "OVERVIEW",
+                "symbol": ticker
+            })
+            time.sleep(1)  # Delay to avoid rate limiting
+
+            print(f"  💰 Fetching QUOTE...")
+            quote = _call_alpha_vantage({
+                "function": "GLOBAL_QUOTE",
+                "symbol": ticker
+            })
+            time.sleep(1)
+
+            print(f"  💸 Fetching CASH_FLOW...")
+            cash_flow = _call_alpha_vantage({
+                "function": "CASH_FLOW",
+                "symbol": ticker
+            })
+            time.sleep(1)
+
+            # THE FIX: Fetch balance sheet for accurate Cash and Debt!
+            print(f"  🏦 Fetching BALANCE_SHEET...")
+            balance_sheet = _call_alpha_vantage({
+                "function": "BALANCE_SHEET",
+                "symbol": ticker
+            })
+            time.sleep(1)
+
+            # Also fetch income statement for additional validation
+            print(f"  📈 Fetching INCOME_STATEMENT...")
+            income_statement = _call_alpha_vantage({
+                "function": "INCOME_STATEMENT",
+                "symbol": ticker
+            })
+        except Exception as e:
+            print(f"  ⚠️ Alpha Vantage failed: {e}")
+            print(f"  🔄 Falling back to Yahoo Finance...")
+            return fetch_from_yahoo(ticker)
+    else:
+        print(f"  ℹ️ No Alpha Vantage API key, using Yahoo Finance...")
+        return fetch_from_yahoo(ticker)
     
     def _to_millions(value):
-        """Convert absolute USD to millions (easier to read)"""
+        """Convert absolute USD to millions"""
         try:
+            if value is None or value == 'None' or value == '':
+                return 0.0
             return float(value) / 1_000_000
         except (TypeError, ValueError):
             return 0.0
     
+    # Get current price
     try:
         price_str = quote["Global Quote"]["05. price"]
         current_price = float(price_str)
     except Exception:
         current_price = 0.0
     
+    # Extract Cash and Debt from BALANCE SHEET (most recent quarter)
+    bs_reports = balance_sheet.get("quarterlyReports", [])
+    latest_bs = bs_reports[0] if bs_reports else {}
+    
+    # Try multiple field names for Total Debt
+    raw_debt = (
+        latest_bs.get("shortLongTermDebtTotal") or 
+        latest_bs.get("totalDebt") or 
+        latest_bs.get("longTermDebt") or 
+        "0"
+    )
+    
+    # Try multiple field names for Cash
+    raw_cash = (
+        latest_bs.get("cashAndCashEquivalentsAtCarryingValue") or 
+        latest_bs.get("cashAndShortTermInvestments") or 
+        latest_bs.get("cash") or
+        "0"
+    )
+    
+    # Also get short-term debt if available
+    short_term_debt = _to_millions(latest_bs.get("shortTermDebt", "0"))
+    long_term_debt = _to_millions(latest_bs.get("longTermDebt", "0"))
+    
+    # Calculate total debt (short-term + long-term)
+    total_debt = _to_millions(raw_debt)
+    if total_debt == 0 and (short_term_debt > 0 or long_term_debt > 0):
+        total_debt = short_term_debt + long_term_debt
+    
     company_data = {
         "ticker": ticker,
         "company_name": overview.get("Name", ticker),
         "current_stock_price": current_price,
         "shares_outstanding": _to_millions(overview.get("SharesOutstanding")),
-        "total_debt": _to_millions(overview.get("TotalDebt")),
-        "cash": _to_millions(overview.get("CashAndCashEquivalentsAtCarryingValue")),
+        "total_debt": total_debt,
+        "short_term_debt": short_term_debt,
+        "long_term_debt": long_term_debt,
+        "cash": _to_millions(raw_cash),
+        "total_assets": _to_millions(latest_bs.get("totalAssets", "0")),
+        "total_liabilities": _to_millions(latest_bs.get("totalLiabilities", "0")),
+        "shareholders_equity": _to_millions(latest_bs.get("totalShareholderEquity", "0")),
     }
     
-    # Historical data (the company's financial history)
+    # Historical cash flow data
     quarterly_reports = cash_flow.get("quarterlyReports", [])
     quarterly_reports = list(quarterly_reports)[:12]
-    quarterly_reports.reverse()  # Chronological order
+    quarterly_reports.reverse()
     
     quarters = []
     operating_cf = []
@@ -428,7 +606,17 @@ def fetch_company_and_cashflows(ticker: str):
         
         operating_cf.append(_to_millions(r.get("operatingCashflow")))
         capex.append(_to_millions(r.get("capitalExpenditures")))
-        net_income.append(_to_millions(r.get("netIncome")))
+        
+        # Get net income from cash flow statement
+        ni = _to_millions(r.get("netIncome", "0"))
+        net_income.append(ni)
+    
+    # If net income is all zeros, try to get from income statement
+    if all(x == 0 for x in net_income):
+        is_reports = income_statement.get("quarterlyReports", [])
+        is_reports = list(is_reports)[:12]
+        is_reports.reverse()
+        net_income = [_to_millions(r.get("netIncome", "0")) for r in is_reports]
     
     historical_data = {
         "quarters": quarters,
@@ -443,67 +631,57 @@ def fetch_company_and_cashflows(ticker: str):
     except (TypeError, ValueError):
         pass
     
-    return company_data, historical_data, assumptions_hint
+    # Add raw financial statement data for debugging/display
+    raw_financials = {
+        "balance_sheet_date": latest_bs.get("fiscalDateEnding", "N/A"),
+        "raw_data": {
+            "cash_from_bs": raw_cash,
+            "debt_from_bs": raw_debt,
+            "short_term_debt": latest_bs.get("shortTermDebt", "0"),
+            "long_term_debt": latest_bs.get("longTermDebt", "0"),
+            "total_assets": latest_bs.get("totalAssets", "0"),
+            "total_liabilities": latest_bs.get("totalLiabilities", "0"),
+        }
+    }
+    
+    return company_data, historical_data, assumptions_hint, raw_financials
 
 
 class DCFModel:
-    """
-    Comprehensive DCF Model Calculator with Enhanced Transparency
-    
-    Think of this as a financial X-ray machine - it lets you see through 
-    the outer appearance of a stock price to its true internal value.
-    """
+    """Comprehensive DCF Model Calculator with Enhanced Transparency"""
     
     def __init__(self, company_data, historical_data, assumptions):
         self.company = company_data
         self.historical = historical_data
         self.assumptions = assumptions
         self.results = {}
-        
-        # Store calculation details for transparency (show your work!)
         self.calculation_details = {}
     
     def calculate_wacc(self):
-        """
-        Calculate Weighted Average Cost of Capital (WACC)
+        """Calculate Weighted Average Cost of Capital (WACC)"""
         
-        METAPHOR: WACC is like the interest rate on a blended loan. Imagine you borrowed
-        money from two sources: your rich uncle (equity) and a bank (debt). WACC tells you
-        what interest rate you're effectively paying when you blend both sources together.
-        """
-        
-        # Cost of Equity using CAPM (Capital Asset Pricing Model)
-        # This answers: "What return do shareholders expect for the risk they're taking?"
         rf = self.assumptions['risk_free_rate']
         beta = self.assumptions['beta']
         mrp = self.assumptions['market_risk_premium']
         
         cost_of_equity = rf + (beta * mrp)
         
-        # Market Cap (what the market says the company is worth)
         shares = self.company['shares_outstanding']
         price = self.company['current_stock_price']
         market_cap = shares * price
         
-        # Net Debt (total debt minus the cash cushion)
         net_debt = self.company['total_debt'] - self.company['cash']
-        
-        # Enterprise Value (the total value of the business)
         enterprise_value = market_cap + net_debt
         
-        # Weights (what percentage of funding comes from each source?)
         equity_weight = market_cap / enterprise_value if enterprise_value > 0 else 1.0
         debt_weight = net_debt / enterprise_value if enterprise_value > 0 else 0.0
         
-        # After-tax cost of debt (debt is cheaper because interest is tax-deductible!)
         cost_of_debt = self.assumptions['cost_of_debt']
         tax_rate = self.assumptions['tax_rate']
         after_tax_cost_debt = cost_of_debt * (1 - tax_rate)
         
-        # WACC Formula: (Equity% × Equity Cost) + (Debt% × After-tax Debt Cost)
         wacc = (equity_weight * cost_of_equity) + (debt_weight * after_tax_cost_debt)
         
-        # Store calculation details for tooltips
         self.calculation_details['wacc'] = {
             'formula': 'WACC = (E/V × Re) + (D/V × Rd × (1-T))',
             'components': {
@@ -522,7 +700,7 @@ class DCFModel:
                 'equity_weight': equity_weight,
                 'debt_weight': debt_weight
             },
-            'explanation': 'WACC represents the average rate the company must pay to finance its assets. It\'s the hurdle rate for investments - projects must earn more than this to create value.'
+            'explanation': 'WACC represents the average rate the company must pay to finance its assets.'
         }
         
         return {
@@ -537,23 +715,15 @@ class DCFModel:
         }
     
     def calculate_historical_metrics(self):
-        """
-        Calculate historical free cash flow and other metrics.
-        
-        METAPHOR: Free Cash Flow is like your take-home pay after all the bills are paid.
-        It's the money left over that the company can use to pay dividends, buy back stock,
-        or invest in growth - the truly "free" money.
-        """
+        """Calculate historical free cash flow and other metrics."""
         fcf = []
         quarters = self.historical.get('quarters', [])
         ocf = self.historical.get('operating_cash_flow', [])
         capex = self.historical.get('capex', [])
         
-        # FCF = Operating Cash Flow + CapEx (CapEx is negative, so we're subtracting it)
         for i in range(len(ocf)):
             fcf.append(ocf[i] + capex[i])
         
-        # TTM = Trailing Twelve Months (the last 4 quarters)
         ttm_length = min(4, len(fcf))
         ttm_fcf = sum(fcf[-ttm_length:]) if fcf else 0
         avg_fcf = ttm_fcf / ttm_length if ttm_length > 0 else 0
@@ -564,7 +734,6 @@ class DCFModel:
         net_income = self.historical.get('net_income', [])
         ttm_net_income = sum(net_income[-ttm_length:]) if net_income else 0
         
-        # Store calculation details
         self.calculation_details['fcf'] = {
             'formula': 'FCF = Operating Cash Flow - Capital Expenditures',
             'components': {
@@ -572,7 +741,7 @@ class DCFModel:
                 'ttm_capex': ttm_capex,
                 'ttm_fcf': ttm_fcf
             },
-            'explanation': 'Free Cash Flow represents the cash available after maintaining/expanding the asset base. It\'s the ultimate measure of financial health.'
+            'explanation': 'Free Cash Flow represents the cash available after maintaining/expanding the asset base.'
         }
         
         return {
@@ -585,13 +754,7 @@ class DCFModel:
         }
     
     def project_cash_flows(self, base_fcf):
-        """
-        Project future free cash flows.
-        
-        METAPHOR: This is like predicting how much taller a child will grow each year.
-        We use growth rates that typically slow down over time (fast growth when young,
-        slower growth when mature).
-        """
+        """Project future free cash flows."""
         projected_fcf = []
         growth_rates = self.assumptions['revenue_growth_rates']
         
@@ -611,20 +774,12 @@ class DCFModel:
         return projected_fcf
     
     def calculate_terminal_value(self, final_fcf, wacc):
-        """
-        Calculate terminal value using perpetual growth method.
-        
-        METAPHOR: Terminal value is like valuing a rental property based on the rent it'll
-        generate forever. We assume the company keeps growing at a steady, sustainable rate
-        into perpetuity (Latin for "forever and ever").
-        """
+        """Calculate terminal value using perpetual growth method."""
         g = self.assumptions['perpetual_growth_rate']
         
-        # Safety check: WACC must be greater than growth rate (otherwise we'd have infinite value!)
         if wacc <= g:
             g = wacc * 0.5
         
-        # Gordon Growth Model: TV = FCF × (1 + g) / (WACC - g)
         terminal_value = (final_fcf * (1 + g)) / (wacc - g)
         
         self.calculation_details['terminal_value'] = {
@@ -635,40 +790,27 @@ class DCFModel:
                 'wacc': wacc,
                 'terminal_value': terminal_value
             },
-            'explanation': 'Terminal Value captures the value of all cash flows beyond the forecast period. It often represents 70-80% of total value.'
+            'explanation': 'Terminal Value captures the value of all cash flows beyond the forecast period.'
         }
         
         return terminal_value
     
     def calculate_dcf_valuation(self):
-        """
-        Perform complete DCF valuation.
+        """Perform complete DCF valuation."""
         
-        METAPHOR: DCF valuation is like determining how much you'd pay today for a machine
-        that prints money every year. But there's a catch: money in the future is worth less
-        than money today (because of inflation and opportunity cost), so we "discount" 
-        future cash flows to present value.
-        """
-        
-        # Calculate WACC (our discount rate)
         wacc_results = self.calculate_wacc()
         wacc = wacc_results['wacc']
         
-        # Historical metrics
         hist_metrics = self.calculate_historical_metrics()
         base_fcf = hist_metrics['ttm_fcf']
         
-        # Project cash flows
         projected_fcf = self.project_cash_flows(base_fcf)
         
-        # Calculate present value of projected cash flows
         pv_fcf = []
         for year, fcf in enumerate(projected_fcf, 1):
-            # PV = FV / (1 + r)^n
             pv = fcf / ((1 + wacc) ** year)
             pv_fcf.append(pv)
         
-        # Terminal value
         if projected_fcf:
             terminal_value = self.calculate_terminal_value(projected_fcf[-1], wacc)
             pv_terminal_value = terminal_value / ((1 + wacc) ** len(projected_fcf))
@@ -676,28 +818,18 @@ class DCFModel:
             terminal_value = 0
             pv_terminal_value = 0
         
-        # Enterprise value (sum of all present values)
         enterprise_value_dcf = sum(pv_fcf) + pv_terminal_value
-        
-        # Equity value (enterprise value adjusted for debt and cash)
         equity_value = enterprise_value_dcf - self.company['total_debt'] + self.company['cash']
         
-        # Per share value (divide by number of shares)
         intrinsic_value_per_share = equity_value / self.company['shares_outstanding'] if self.company['shares_outstanding'] > 0 else 0
-        
-        # Current market value
         current_market_value = self.company['current_stock_price']
         
-        # Upside/Downside (how much room to run or fall?)
         if current_market_value > 0:
             upside_pct = ((intrinsic_value_per_share - current_market_value) / current_market_value) * 100
         else:
             upside_pct = 0
         
-        # IRR Calculation (simplified)
         irr = self.calculate_irr(projected_fcf, terminal_value, wacc_results['enterprise_value'])
-        
-        # EV Multiples
         ev_fcf_multiple = wacc_results['enterprise_value'] / hist_metrics['ttm_fcf'] if hist_metrics['ttm_fcf'] > 0 else 0
         
         results = {
@@ -714,19 +846,14 @@ class DCFModel:
             'upside_pct': upside_pct,
             'irr': irr,
             'ev_fcf_multiple': ev_fcf_multiple,
-            'calculation_details': self.calculation_details  # The "show your work" section!
+            'calculation_details': self.calculation_details
         }
         
         self.results = results
         return results
     
     def calculate_irr(self, cash_flows, terminal_value, initial_investment):
-        """
-        Calculate Internal Rate of Return (simplified).
-        
-        METAPHOR: IRR is like calculating the average annual return on an investment.
-        If you buy a stock today and sell it in 5 years, what's your annualized return?
-        """
+        """Calculate Internal Rate of Return (simplified)."""
         if not cash_flows or initial_investment <= 0:
             return 0
         
@@ -751,11 +878,7 @@ def index():
 @app.route('/api/analyze', methods=['POST'])
 def analyze_ticker():
     """
-    Comprehensive analysis endpoint that fetches:
-    1. Financial data from Alpha Vantage
-    2. Reddit sentiment
-    3. News articles
-    4. Calculates DCF with full transparency
+    Comprehensive analysis endpoint with data quality validation
     """
     try:
         if not ALPHAVANTAGE_API_KEY:
@@ -786,12 +909,26 @@ def analyze_ticker():
         # 1. Fetch financial data from Alpha Vantage
         print(f"[1/4] Fetching financial data from Alpha Vantage...")
         try:
-            company_data, historical_data, assumptions_hint = fetch_company_and_cashflows(ticker)
+            company_data, historical_data, assumptions_hint, raw_financials = fetch_company_and_cashflows(ticker)
             print(f"✓ Financial data fetched successfully")
+            print(f"  Cash: ${company_data['cash']:.2f}M")
+            print(f"  Debt: ${company_data['total_debt']:.2f}M")
+            print(f"  Shares: {company_data['shares_outstanding']:.2f}M")
         except Exception as e:
             error_msg = f'Failed to fetch financial data: {str(e)}'
             print(f"✗ {error_msg}")
             return jsonify({'success': False, 'error': error_msg}), 400
+        
+        # CHECK DATA QUALITY
+        print(f"\n📋 Checking data quality...")
+        quality_report = DataQualityChecker.get_data_quality_report(company_data, historical_data)
+        print(f"  Quality: {quality_report['quality_emoji']} {quality_report['quality']}")
+        if quality_report['issues']:
+            for issue in quality_report['issues']:
+                print(f"    {issue}")
+        if quality_report['warnings']:
+            for warning in quality_report['warnings']:
+                print(f"    {warning}")
         
         # 2. Scrape Reddit sentiment
         print(f"\n[2/4] Scraping Reddit for community sentiment...")
@@ -821,7 +958,7 @@ def analyze_ticker():
                     ticker
                 )
                 news_data = news_analyzer.analyze_news_sentiment(articles)
-                news_data['articles'] = articles[:10]  # Top 10 articles
+                news_data['articles'] = articles[:10]
                 print(f"✓ News analyzed ({news_data['total_articles']} articles)")
             else:
                 print(f"⚠ News API key not configured (optional)")
@@ -871,12 +1008,15 @@ def analyze_ticker():
         results['assumptions'] = assumptions
         results['reddit_sentiment'] = reddit_data
         results['news_analysis'] = news_data
+        results['data_quality'] = quality_report
+        results['raw_financials'] = raw_financials
         
         print(f"\n{'='*60}")
         print(f"Analysis complete!")
         print(f"Intrinsic Value: ${results['intrinsic_value_per_share']:.2f}")
         print(f"Current Price: ${results['current_market_value']:.2f}")
         print(f"Upside: {results['upside_pct']:.1f}%")
+        print(f"Data Quality: {quality_report['quality']}")
         print(f"{'='*60}\n")
         
         return jsonify({
@@ -916,12 +1056,14 @@ def get_defaults():
 if __name__ == '__main__':
     print("=" * 60)
     print("🚀 Enhanced Universal DCF Valuation Model")
+    print("   WITH DATA QUALITY VALIDATION")
     print("=" * 60)
-    print("\n✨ New Features:")
+    print("\n✨ Features:")
+    print("  • Proper Balance Sheet data fetching")
+    print("  • Data quality validation & flags")
     print("  • Reddit sentiment analysis")
     print("  • News article integration")
-    print("  • Interactive tooltips with full calculations")
-    print("  • Educational links to Investopedia")
+    print("  • Interactive tooltips")
     print("\nStarting web server...")
     print("Open your browser and navigate to: http://localhost:5000")
     print("\nPress Ctrl+C to stop the server")

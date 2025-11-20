@@ -590,6 +590,8 @@
             </p>
         </div>
 
+
+
         <div class="content">
             <div class="alert" id="alert"></div>
 
@@ -956,6 +958,170 @@
                     </table>
                 </div>
             `;
+
+            // Consolidated Financial Data Section with Quality Indicators
+            const quality = results.data_quality || {};
+            const raw = results.raw_financials || {};
+
+            let qualityHTML = `
+                <div class="section">
+                    <h2 class="section-title">
+                        📋 Consolidated Financial Data
+                        <span style="font-size: 0.6em; margin-left: 10px;">
+                            ${quality.quality_emoji || '❓'} Data Quality: ${quality.quality || 'Unknown'}
+                        </span>
+                    </h2>
+
+                    <!-- Data Quality Alerts -->
+                    ${quality.issues && quality.issues.length > 0 ? `
+                        <div class="info-box danger">
+                            <p><strong>⚠️ Critical Data Issues:</strong></p>
+                            ${quality.issues.map(issue => `<p>• ${issue}</p>`).join('')}
+                        </div>
+                    ` : ''}
+
+                    ${quality.warnings && quality.warnings.length > 0 ? `
+                        <div class="info-box warning">
+                            <p><strong>⚠️ Data Quality Warnings:</strong></p>
+                            ${quality.warnings.map(warning => `<p>• ${warning}</p>`).join('')}
+                        </div>
+                    ` : ''}
+
+                    ${quality.quality === 'EXCELLENT' ? `
+                        <div class="info-box">
+                            <p><strong>✅ Excellent Data Quality</strong></p>
+                            <p>All financial data successfully loaded and validated.</p>
+                        </div>
+                    ` : ''}
+
+                    <!-- Balance Sheet Data -->
+                    <h3 style="margin-top: 30px; color: #1e3c72; font-size: 1.4em;">Balance Sheet (as of ${raw.balance_sheet_date || 'N/A'})</h3>
+                    <div class="results-grid">
+                        <div class="result-card ${company.cash > 0 ? '' : 'negative'}">
+                            <div class="result-label">Cash & Equivalents</div>
+                            <div class="result-value ${company.cash > 0 ? '' : 'negative'}">
+                                $${company.cash.toFixed(2)}M
+                            </div>
+                            ${company.cash === 0 ? '<p style="font-size:0.75em;color:#ef4444;margin-top:5px;">⚠️ Zero value detected</p>' : ''}
+                        </div>
+
+                        <div class="result-card ${company.total_debt >= 0 ? '' : 'negative'}">
+                            <div class="result-label">Total Debt</div>
+                            <div class="result-value">$${company.total_debt.toFixed(2)}M</div>
+                            ${company.total_debt === 0 ? '<p style="font-size:0.75em;color:#f59e0b;margin-top:5px;">⚠️ Zero debt (unusual)</p>' : ''}
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Short-Term Debt</div>
+                            <div class="result-value">$${(company.short_term_debt || 0).toFixed(2)}M</div>
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Long-Term Debt</div>
+                            <div class="result-value">$${(company.long_term_debt || 0).toFixed(2)}M</div>
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Total Assets</div>
+                            <div class="result-value">$${(company.total_assets || 0).toFixed(2)}M</div>
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Total Liabilities</div>
+                            <div class="result-value">$${(company.total_liabilities || 0).toFixed(2)}M</div>
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Shareholders' Equity</div>
+                            <div class="result-value">$${(company.shareholders_equity || 0).toFixed(2)}M</div>
+                        </div>
+
+                        <div class="result-card ${company.shares_outstanding > 0 ? '' : 'negative'}">
+                            <div class="result-label">Shares Outstanding</div>
+                            <div class="result-value ${company.shares_outstanding > 0 ? '' : 'negative'}">
+                                ${company.shares_outstanding.toFixed(2)}M
+                            </div>
+                            ${company.shares_outstanding === 0 ? '<p style="font-size:0.75em;color:#ef4444;margin-top:5px;">❌ Missing!</p>' : ''}
+                        </div>
+                    </div>
+
+                    <!-- Key Ratios from Balance Sheet -->
+                    <h3 style="margin-top: 30px; color: #1e3c72; font-size: 1.4em;">Key Financial Ratios</h3>
+                    <div class="results-grid">
+                        <div class="result-card">
+                            <div class="result-label">Net Debt</div>
+                            <div class="result-value">
+                                $${(company.total_debt - company.cash).toFixed(2)}M
+                            </div>
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Debt-to-Equity Ratio</div>
+                            <div class="result-value">
+                                ${company.shareholders_equity > 0 ? (company.total_debt / company.shareholders_equity).toFixed(2) : 'N/A'}
+                            </div>
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Current Price</div>
+                            <div class="result-value">$${results.current_market_value.toFixed(2)}</div>
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Market Cap</div>
+                            <div class="result-value">$${results.wacc_results.market_cap.toFixed(2)}M</div>
+                        </div>
+                    </div>
+
+                    <!-- Cash Flow Summary -->
+                    <h3 style="margin-top: 30px; color: #1e3c72; font-size: 1.4em;">Cash Flow Summary (TTM)</h3>
+                    <div class="results-grid">
+                        <div class="result-card ${results.historical_metrics.ttm_operating_cf > 0 ? 'positive' : 'negative'}">
+                            <div class="result-label">Operating Cash Flow</div>
+                            <div class="result-value ${results.historical_metrics.ttm_operating_cf > 0 ? 'positive' : 'negative'}">
+                                $${results.historical_metrics.ttm_operating_cf.toFixed(2)}M
+                            </div>
+                            ${results.historical_metrics.ttm_operating_cf === 0 ? '<p style="font-size:0.75em;color:#ef4444;margin-top:5px;">❌ Zero OCF!</p>' : ''}
+                        </div>
+
+                        <div class="result-card">
+                            <div class="result-label">Capital Expenditures</div>
+                            <div class="result-value">
+                                $${results.historical_metrics.ttm_capex.toFixed(2)}M
+                            </div>
+                            ${results.historical_metrics.ttm_capex === 0 ? '<p style="font-size:0.75em;color:#f59e0b;margin-top:5px;">⚠️ No CapEx reported</p>' : ''}
+                        </div>
+
+                        <div class="result-card ${results.historical_metrics.ttm_fcf > 0 ? 'positive' : 'negative'}">
+                            <div class="result-label">Free Cash Flow</div>
+                            <div class="result-value ${results.historical_metrics.ttm_fcf > 0 ? 'positive' : 'negative'}">
+                                $${results.historical_metrics.ttm_fcf.toFixed(2)}M
+                            </div>
+                        </div>
+
+                        <div class="result-card ${results.historical_metrics.ttm_net_income > 0 ? 'positive' : 'negative'}">
+                            <div class="result-label">Net Income</div>
+                            <div class="result-value ${results.historical_metrics.ttm_net_income > 0 ? 'positive' : 'negative'}">
+                                $${results.historical_metrics.ttm_net_income.toFixed(2)}M
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Data Source Information -->
+                    <div class="info-box" style="margin-top: 30px;">
+                        <p><strong>📊 Data Sources:</strong></p>
+                        <p>• Balance Sheet: Alpha Vantage API (Quarter ending ${raw.balance_sheet_date || 'N/A'})</p>
+                        <p>• Cash Flow: Last 12 quarters from quarterly reports</p>
+                        <p>• Market Data: Real-time quote from Alpha Vantage</p>
+                        ${quality.usable ?
+                            '<p style="color: #10b981; margin-top: 10px;"><strong>✅ Data is complete and suitable for DCF analysis</strong></p>' :
+                            '<p style="color: #ef4444; margin-top: 10px;"><strong>⚠️ Data has issues - DCF results may be unreliable</strong></p>'
+                        }
+                    </div>
+                </div>
+            `;
+
+            container.innerHTML += qualityHTML;
         }
 
         function displaySentimentFeed(results) {
