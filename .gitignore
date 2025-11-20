@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.env
+
+# VSCode
+.vscode/
+
+# Data
+*.csv
+*.xlsx
+cache/

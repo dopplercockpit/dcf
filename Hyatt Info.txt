@@ -1,0 +1,48 @@
+{
+  "quarters": ["Q3 2022","Q4 2022","Q1 2023","Q2 2023","Q3 2023","Q4 2023","Q1 2024","Q2 2024","Q3 2024","Q4 2024","Q1 2025","Q2 2025"],
+  "operating_cash_flow": [20.0, 271.0, 225.0, 146.0, 55.0, 374.0, 242.0, 177.0, -21.0, 235.0, 153.0, -67.0],
+  "capex": [-38.0, -59.0, -30.0, -50.0, -54.0, -64.0, -34.0, -42.0, -43.0, -51.0, -30.0, -44.0]
+}
+
+{
+  "company_data": {
+    "ticker": "H",
+    "company_name": "Hyatt Hotels Corporation",
+    "current_stock_price": 138.00,
+    "shares_outstanding_millions": 102.0,
+    "total_debt_millions": 6000.0,
+    "cash_equivalents_millions": 851.0
+  },
+  "historical_data": {
+    "quarters": [
+      "Q2 2025","Q1 2025","Q4 2024","Q3 2024","Q2 2024","Q1 2024",
+      "Q4 2023","Q3 2023","Q2 2023","Q1 2023","Q4 2022","Q3 2022"
+    ],
+    "operating_cash_flow": [-67.0, 153.0, 235.0, -21.0, 177.0, 242.0, 374.0, 55.0, 146.0, 225.0, 271.0, 20.0],
+    "capex": [-44.0, -30.0, -51.0, -43.0, -42.0, -34.0, -64.0, -54.0, -50.0, -30.0, -59.0, -38.0]
+  },
+  "assumptions": {
+    "tax_rate": 21.0,
+    "risk_free_rate": 4.5,
+    "market_risk_premium": 8.0,
+    "beta": 1.15,
+    "cost_of_debt": 5.0,
+    "perpetual_growth_rate": 2.5,
+    "revenue_growth": [6.0, 5.5, 5.0, 4.5, 4.0]
+  }
+}
+Ticker Symbol: H
+
+Company Name: Hyatt Hotels Corporation
+
+Current Stock Price ($): ~138.00 (live on Hyatt IR “Stock Info”). 
+Hyatt Investors
+
+Shares Outstanding (Millions): 102.0 (latest FY data ≈ 0.102B). 
+MacroTrends
+
+Total Debt ($M): 6000 (Q2-2025 results noted total debt ≈ $6.0B). 
+Hyatt Investors
+
+Cash & Equivalents ($M): 851 (End cash position 06-2025). 
+Barchart.com
