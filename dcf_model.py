@@ -177,49 +177,107 @@ class NewsAnalyzer:
         self.api_key = api_key
         self.base_url = "https://newsapi.org/v2/everything"
     
-    def fetch_company_news(self, company_name, ticker, days=30):
+    def fetch_company_and_cashflows(ticker: str):
         """
-        Fetch recent news articles about the company.
-        We search for both the company name and ticker to cast a wide net.
+        Fetch company snapshot + last 12 quarters of CF data from Alpha Vantage.
+        Updated to include BALANCE_SHEET for accurate Cash and Debt figures.
         """
-        if not self.api_key:
-            return []
-        
+        ticker = ticker.upper().strip()
+
+        # 1) Company overview (fundamentals: name, shares, beta, etc.)
+        overview = _call_alpha_vantage({
+            "function": "OVERVIEW",
+            "symbol": ticker
+        })
+
+        # 2) Real-time / latest quote for current price
+        quote = _call_alpha_vantage({
+            "function": "GLOBAL_QUOTE",
+            "symbol": ticker
+        })
+
+        # 3) Cash flow statement (quarterly)
+        cash_flow = _call_alpha_vantage({
+            "function": "CASH_FLOW",
+            "symbol": ticker
+        })
+
+        # 4) Balance Sheet (NEW: Required for Cash and Debt!)
+        balance_sheet = _call_alpha_vantage({
+            "function": "BALANCE_SHEET",
+            "symbol": ticker
+        })
+
+        # ---- company_data for your model ----
+        def _to_millions(value):
+            try:
+                if value is None or value == 'None': return 0.0
+                return float(value) / 1_000_000
+            except (TypeError, ValueError):
+                return 0.0
+
         try:
-            # Calculate date range (like setting a time machine)
-            to_date = datetime.now()
-            from_date = to_date - timedelta(days=days)
-            
-            params = {
-                'q': f'"{company_name}" OR {ticker}',
-                'apiKey': self.api_key,
-                'language': 'en',
-                'sortBy': 'publishedAt',
-                'from': from_date.strftime('%Y-%m-%d'),
-                'to': to_date.strftime('%Y-%m-%d'),
-                'pageSize': 50
-            }
-            
-            response = requests.get(self.base_url, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                articles = data.get('articles', [])
-                
-                return [{
-                    'title': article['title'],
-                    'description': article.get('description', ''),
-                    'url': article['url'],
-                    'source': article['source']['name'],
-                    'published_at': article['publishedAt'],
-                    'content': article.get('content', '')
-                } for article in articles]
-            
-        except Exception as e:
-            print(f"Error fetching news: {e}")
-        
-        return []
-    
+            price_str = quote["Global Quote"]["05. price"]
+            current_price = float(price_str)
+        except Exception:
+            current_price = 0.0
+
+        # Extract Cash and Debt from the most recent quarterly report
+        # Alpha Vantage reports are usually sorted newest to oldest, but we grab index 0 to be safe
+        bs_reports = balance_sheet.get("quarterlyReports", [])
+        latest_bs = bs_reports[0] if bs_reports else {}
+
+        # Try multiple keys for Total Debt as API naming can vary
+        raw_debt = latest_bs.get("shortLongTermDebtTotal") or latest_bs.get("totalDebt") or "0"
+
+        # Try multiple keys for Cash
+        raw_cash = latest_bs.get("cashAndCashEquivalentsAtCarryingValue") or latest_bs.get("cashAndShortTermInvestments") or "0"
+
+        company_data = {
+            "ticker": ticker,
+            "company_name": overview.get("Name", ticker),
+            "current_stock_price": current_price,
+            "shares_outstanding": _to_millions(overview.get("SharesOutstanding")),
+            "total_debt": _to_millions(raw_debt),
+            "cash": _to_millions(raw_cash),
+        }
+
+        # ---- historical_data (quarters, ocf, capex, net income) ----
+        quarterly_reports = cash_flow.get("quarterlyReports", [])
+
+        # Alpha Vantage returns most recent first → reverse to get chronological
+        quarterly_reports = list(quarterly_reports)[:12]
+        quarterly_reports.reverse()
+
+        quarters = []
+        operating_cf = []
+        capex = []
+        net_income = []
+
+        for r in quarterly_reports:
+            date = r.get("fiscalDateEnding")  # e.g. "2024-09-30"
+            quarters.append(date or "N/A")
+
+            operating_cf.append(_to_millions(r.get("operatingCashflow")))
+            capex.append(_to_millions(r.get("capitalExpenditures")))
+            net_income.append(_to_millions(r.get("netIncome")))
+
+        historical_data = {
+            "quarters": quarters,
+            "operating_cash_flow": operating_cf,
+            "capex": capex,
+            "net_income": net_income,
+        }
+
+        # Optional: hints for model assumptions (e.g. beta)
+        assumptions_hint = {}
+        try:
+            assumptions_hint["beta"] = float(overview.get("Beta"))
+        except (TypeError, ValueError):
+            pass
+
+        return company_data, historical_data, assumptions_hint
+
     def analyze_news_sentiment(self, articles):
         """
         Analyze news sentiment - are journalists painting a rosy or gloomy picture?
