@@ -714,27 +714,120 @@
             document.getElementById('ticker').focus();
         }
 
+        // SEC-style number formatting helpers
+        function formatMoney(value) {
+            // Format as $X,XXX with thousand separators, negatives in red parentheses
+            if (value === null || value === undefined || isNaN(value)) return 'N/A';
+            const absVal = Math.abs(value);
+            const formatted = Math.round(absVal).toLocaleString('en-US');
+            if (value < 0) {
+                return `<span style="color: #ef4444;">($${formatted})</span>`;
+            }
+            return `$${formatted}`;
+        }
+
+        function formatPercent(value) {
+            // Format as X.X% with one decimal, negatives in red parentheses
+            if (value === null || value === undefined || isNaN(value)) return 'N/A';
+            const pct = value * 100;
+            const formatted = Math.abs(pct).toFixed(1);
+            if (pct < 0) {
+                return `<span style="color: #ef4444;">(${formatted}%)</span>`;
+            }
+            return `${formatted}%`;
+        }
+
+        function formatMultiple(value) {
+            // Format as Xx rounded to integer, negatives in red parentheses
+            if (value === null || value === undefined || isNaN(value)) return 'N/A';
+            const rounded = Math.round(Math.abs(value));
+            if (value < 0) {
+                return `<span style="color: #ef4444;">(${rounded}x)</span>`;
+            }
+            return `${rounded}x`;
+        }
+
+        function formatNumber(value) {
+            // Format plain numbers with thousand separators, negatives in red parentheses
+            if (value === null || value === undefined || isNaN(value)) return 'N/A';
+            const formatted = Math.abs(value).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+            if (value < 0) {
+                return `<span style="color: #ef4444;">(${formatted})</span>`;
+            }
+            return formatted;
+        }
+
         function createTooltip(label, details, investopediaLink) {
             const formula = details.formula || '';
             const explanation = details.explanation || '';
             const components = details.components || {};
 
+            // Acronym mappings matching formula variables exactly
+            const acronymMap = {
+                // WACC formula: WACC = (E/V × Re) + (D/V × Rd × (1-T))
+                'risk_free_rate': 'Rf',
+                'market_risk_premium': 'MRP',
+                'beta': 'β',
+                'cost_of_equity': 'Re',
+                'cost_of_debt': 'Rd',
+                'after_tax_cost_debt': 'Rd×(1-T)',
+                'tax_rate': 'T',
+                'equity_weight': 'E/V',
+                'debt_weight': 'D/V',
+                'market_cap': 'E',
+                'net_debt': 'D',
+                'enterprise_value': 'EV',
+                'wacc': 'WACC',
+                // Terminal Value formula: TV = FCF(final) × (1 + g) / (WACC - g)
+                'final_fcf': 'FCF(final)',
+                'growth_rate': 'g',
+                'perpetual_growth_rate': 'g',
+                'terminal_value': 'TV',
+                // FCF formula: FCF = Operating Cash Flow - Capital Expenditures
+                'ttm_operating_cf': 'OCF',
+                'ttm_capex': 'CapEx',
+                'ttm_fcf': 'FCF',
+                // Equity Value formula: Equity Value = Enterprise Value - Total Debt + Cash
+                'total_debt': 'Total Debt',
+                'cash': 'Cash',
+                'equity_value': 'Equity Value',
+                // Intrinsic Value formula: Intrinsic Value = Equity Value / Shares Outstanding
+                'shares_outstanding': 'Shares',
+                'intrinsic_value': 'IV'
+            };
+
             let componentText = '';
             for (const [key, value] of Object.entries(components)) {
                 const displayKey = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                const acronym = acronymMap[key] ? ` (${acronymMap[key]})` : '';
                 let displayValue = value;
-                
+
                 if (typeof value === 'number') {
                     if (key.includes('rate') || key.includes('weight') || key.includes('tax')) {
-                        displayValue = (value * 100).toFixed(2) + '%';
-                    } else if (value > 1000) {
-                        displayValue = '$' + value.toFixed(0) + 'M';
+                        // Percentages: one decimal place
+                        const pct = value * 100;
+                        if (pct < 0) {
+                            displayValue = `<span style="color: #ef4444;">(${Math.abs(pct).toFixed(1)}%)</span>`;
+                        } else {
+                            displayValue = `${pct.toFixed(1)}%`;
+                        }
+                    } else if (key.includes('multiple')) {
+                        // Multiples: rounded to integer
+                        displayValue = value < 0
+                            ? `<span style="color: #ef4444;">(${Math.round(Math.abs(value))}x)</span>`
+                            : `${Math.round(value)}x`;
                     } else {
-                        displayValue = value.toFixed(4);
+                        // Money values: thousand separators
+                        const formatted = Math.round(Math.abs(value)).toLocaleString('en-US');
+                        if (value < 0) {
+                            displayValue = `<span style="color: #ef4444;">($${formatted})</span>`;
+                        } else {
+                            displayValue = `$${formatted}`;
+                        }
                     }
                 }
-                
-                componentText += `<strong>${displayKey}:</strong> ${displayValue}<br>`;
+
+                componentText += `<strong>${displayKey}${acronym}:</strong> ${displayValue}<br>`;
             }
 
             return `
@@ -758,6 +851,10 @@
 
             // Determine recommendation
             let recommendation, returnText, arrowHTML, arrowClass;
+            const formattedUpside = upside < 0
+                ? `<span style="color: #ef4444;">(${Math.abs(upside).toFixed(1)}%)</span>`
+                : `${upside.toFixed(1)}%`;
+
             if (upside >= 20) {
                 recommendation = '🟢 STRONG BUY - Significantly undervalued';
                 returnText = `Potential upside of ${upside.toFixed(1)}% to fair value`;
@@ -768,11 +865,11 @@
                 arrowHTML = '↗'; arrowClass = 'arrow up';
             } else if (upside >= -10) {
                 recommendation = '🟡 HOLD - Fairly valued';
-                returnText = `Trading near fair value (${upside.toFixed(1)}% ${upside >= 0 ? 'upside' : 'downside'})`;
+                returnText = `Trading near fair value (${upside >= 0 ? upside.toFixed(1) + '% upside' : '(' + Math.abs(upside).toFixed(1) + '%) downside'})`;
                 arrowHTML = '→'; arrowClass = 'arrow';
             } else {
                 recommendation = '🔴 SELL - Overvalued';
-                returnText = `Potential downside of ${Math.abs(upside).toFixed(1)}% to fair value`;
+                returnText = `Potential downside of (${Math.abs(upside).toFixed(1)}%) to fair value`;
                 arrowHTML = '↘'; arrowClass = 'arrow down';
             }
 
@@ -802,6 +899,8 @@
                         </div>
                     </div>
 
+                    <p style="font-size: 0.75em; color: #666; text-align: right; margin-top: 5px;"><em>All dollar amounts in millions (M) unless otherwise noted</em></p>
+
                     <div class="info-box">
                         <p><strong>Recommendation:</strong> ${recommendation}</p>
                         <p><strong>Potential Return:</strong> ${returnText}</p>
@@ -811,14 +910,14 @@
                         <div class="result-card ${upside >= 0 ? 'positive' : 'negative'}">
                             <div class="result-label">Upside/Downside</div>
                             <div class="result-value ${upside >= 0 ? 'positive' : 'negative'}">
-                                ${(upside >= 0 ? '+' : '')}${upside.toFixed(1)}%
+                                ${upside >= 0 ? '+' + upside.toFixed(1) + '%' : '<span style="color: #ef4444;">(' + Math.abs(upside).toFixed(1) + '%)</span>'}
                             </div>
                         </div>
                         <div class="result-card">
                             <div class="result-label">
                                 ${createTooltip('WACC', details.wacc || {}, 'https://www.investopedia.com/terms/w/wacc.asp')}
                             </div>
-                            <div class="result-value">${(results.wacc_results.wacc * 100).toFixed(2)}%</div>
+                            <div class="result-value">${(results.wacc_results.wacc * 100).toFixed(1)}%</div>
                         </div>
                         <div class="result-card">
                             <div class="result-label">
@@ -828,7 +927,7 @@
                                     explanation: 'The return shareholders expect for investing in this company, calculated using the Capital Asset Pricing Model (CAPM).'
                                 }, 'https://www.investopedia.com/terms/c/costofequity.asp')}
                             </div>
-                            <div class="result-value">${(results.wacc_results.cost_of_equity * 100).toFixed(2)}%</div>
+                            <div class="result-value">${(results.wacc_results.cost_of_equity * 100).toFixed(1)}%</div>
                         </div>
                         <div class="result-card">
                             <div class="result-label">
@@ -836,7 +935,7 @@
                                     explanation: 'Internal Rate of Return - the annualized return you would earn by buying at current price and receiving the projected cash flows.'
                                 }, 'https://www.investopedia.com/terms/i/irr.asp')}
                             </div>
-                            <div class="result-value">${(results.irr * 100).toFixed(2)}%</div>
+                            <div class="result-value">${(results.irr * 100).toFixed(1)}%</div>
                         </div>
                     </div>
 
@@ -847,7 +946,7 @@
                                     explanation: 'The total value of the business, including both equity and debt, calculated from discounted future cash flows.'
                                 }, 'https://www.investopedia.com/terms/e/enterprisevalue.asp')}
                             </div>
-                            <div class="result-value">$${results.enterprise_value_dcf.toFixed(0)}M</div>
+                            <div class="result-value">${formatMoney(results.enterprise_value_dcf)}</div>
                         </div>
                         <div class="result-card">
                             <div class="result-label">
@@ -862,13 +961,13 @@
                                     explanation: 'The value attributable to shareholders after accounting for debt and cash.'
                                 }, 'https://www.investopedia.com/terms/m/marketvalue.asp')}
                             </div>
-                            <div class="result-value">$${results.equity_value.toFixed(0)}M</div>
+                            <div class="result-value">${formatMoney(results.equity_value)}</div>
                         </div>
                         <div class="result-card">
                             <div class="result-label">
                                 ${createTooltip('Terminal Value', details.terminal_value || {}, 'https://www.investopedia.com/terms/t/terminalvalue.asp')}
                             </div>
-                            <div class="result-value">$${results.terminal_value.toFixed(0)}M</div>
+                            <div class="result-value">${formatMoney(results.terminal_value)}</div>
                         </div>
                         <div class="result-card">
                             <div class="result-label">
@@ -876,7 +975,7 @@
                                     explanation: 'How many years of current free cash flow it would take to pay for the enterprise value. Lower is generally better.'
                                 }, 'https://www.investopedia.com/terms/e/ev-fcf.asp')}
                             </div>
-                            <div class="result-value">${results.ev_fcf_multiple.toFixed(2)}x</div>
+                            <div class="result-value">${formatMultiple(results.ev_fcf_multiple)}</div>
                         </div>
                     </div>
                 </div>
@@ -896,22 +995,28 @@
                             </tr>
                         </thead>
                         <tbody>
-                            ${results.historical_data.quarters.map((q, i) => `
+                            ${results.historical_data.quarters.map((q, i) => {
+                                const ocf = results.historical_data.operating_cash_flow[i];
+                                const capex = results.historical_data.capex[i];
+                                const fcf = results.historical_metrics.quarterly_fcf[i];
+                                const ni = results.historical_data.net_income[i] || 0;
+                                return `
                                 <tr>
                                     <td><strong>${q}</strong></td>
-                                    <td>$${results.historical_data.operating_cash_flow[i].toFixed(0)}M</td>
-                                    <td>$${results.historical_data.capex[i].toFixed(0)}M</td>
-                                    <td><strong>$${results.historical_metrics.quarterly_fcf[i].toFixed(0)}M</strong></td>
-                                    <td>$${(results.historical_data.net_income[i] || 0).toFixed(0)}M</td>
+                                    <td>${formatMoney(ocf)}</td>
+                                    <td>${formatMoney(capex)}</td>
+                                    <td><strong>${formatMoney(fcf)}</strong></td>
+                                    <td>${formatMoney(ni)}</td>
                                 </tr>
-                            `).join('')}
+                                `;
+                            }).join('')}
                         </tbody>
                     </table>
 
                     <div class="info-box">
-                        <p><strong>TTM Operating Cash Flow:</strong> $${results.historical_metrics.ttm_operating_cf.toFixed(0)}M</p>
-                        <p><strong>TTM Free Cash Flow:</strong> $${results.historical_metrics.ttm_fcf.toFixed(0)}M</p>
-                        <p><strong>TTM Net Income:</strong> $${results.historical_metrics.ttm_net_income.toFixed(0)}M</p>
+                        <p><strong>TTM Operating Cash Flow:</strong> ${formatMoney(results.historical_metrics.ttm_operating_cf)}</p>
+                        <p><strong>TTM Free Cash Flow:</strong> ${formatMoney(results.historical_metrics.ttm_fcf)}</p>
+                        <p><strong>TTM Net Income:</strong> ${formatMoney(results.historical_metrics.ttm_net_income)}</p>
                     </div>
                 </div>
 
@@ -940,18 +1045,18 @@
                                 return `
                                     <tr>
                                         <td><strong>Year ${year}</strong></td>
-                                        <td>$${fcf.toFixed(2)}M</td>
+                                        <td>${formatMoney(fcf)}</td>
                                         <td>${discount.toFixed(4)}</td>
-                                        <td><strong>$${pv.toFixed(2)}M</strong></td>
+                                        <td><strong>${formatMoney(pv)}</strong></td>
                                         <td>${(growth * 100).toFixed(1)}%</td>
                                     </tr>
                                 `;
                             }).join('')}
                             <tr style="background-color: #e7f3ff; font-weight: bold;">
                                 <td><strong>Terminal Value</strong></td>
-                                <td>$${results.terminal_value.toFixed(2)}M</td>
+                                <td>${formatMoney(results.terminal_value)}</td>
                                 <td>${(1 / Math.pow(1 + results.wacc_results.wacc, 5)).toFixed(4)}</td>
-                                <td><strong>$${results.pv_terminal_value.toFixed(2)}M</strong></td>
+                                <td><strong>${formatMoney(results.pv_terminal_value)}</strong></td>
                                 <td>${(results.assumptions.perpetual_growth_rate * 100).toFixed(1)}%</td>
                             </tr>
                         </tbody>
@@ -1000,46 +1105,46 @@
                         <div class="result-card ${company.cash > 0 ? '' : 'negative'}">
                             <div class="result-label">Cash & Equivalents</div>
                             <div class="result-value ${company.cash > 0 ? '' : 'negative'}">
-                                $${company.cash.toFixed(2)}M
+                                ${formatMoney(company.cash)}
                             </div>
                             ${company.cash === 0 ? '<p style="font-size:0.75em;color:#ef4444;margin-top:5px;">⚠️ Zero value detected</p>' : ''}
                         </div>
 
                         <div class="result-card ${company.total_debt >= 0 ? '' : 'negative'}">
                             <div class="result-label">Total Debt</div>
-                            <div class="result-value">$${company.total_debt.toFixed(2)}M</div>
+                            <div class="result-value">${formatMoney(company.total_debt)}</div>
                             ${company.total_debt === 0 ? '<p style="font-size:0.75em;color:#f59e0b;margin-top:5px;">⚠️ Zero debt (unusual)</p>' : ''}
                         </div>
 
                         <div class="result-card">
                             <div class="result-label">Short-Term Debt</div>
-                            <div class="result-value">$${(company.short_term_debt || 0).toFixed(2)}M</div>
+                            <div class="result-value">${formatMoney(company.short_term_debt || 0)}</div>
                         </div>
 
                         <div class="result-card">
                             <div class="result-label">Long-Term Debt</div>
-                            <div class="result-value">$${(company.long_term_debt || 0).toFixed(2)}M</div>
+                            <div class="result-value">${formatMoney(company.long_term_debt || 0)}</div>
                         </div>
 
                         <div class="result-card">
                             <div class="result-label">Total Assets</div>
-                            <div class="result-value">$${(company.total_assets || 0).toFixed(2)}M</div>
+                            <div class="result-value">${formatMoney(company.total_assets || 0)}</div>
                         </div>
 
                         <div class="result-card">
                             <div class="result-label">Total Liabilities</div>
-                            <div class="result-value">$${(company.total_liabilities || 0).toFixed(2)}M</div>
+                            <div class="result-value">${formatMoney(company.total_liabilities || 0)}</div>
                         </div>
 
                         <div class="result-card">
                             <div class="result-label">Shareholders' Equity</div>
-                            <div class="result-value">$${(company.shareholders_equity || 0).toFixed(2)}M</div>
+                            <div class="result-value">${formatMoney(company.shareholders_equity || 0)}</div>
                         </div>
 
                         <div class="result-card ${company.shares_outstanding > 0 ? '' : 'negative'}">
                             <div class="result-label">Shares Outstanding</div>
                             <div class="result-value ${company.shares_outstanding > 0 ? '' : 'negative'}">
-                                ${company.shares_outstanding.toFixed(2)}M
+                                ${Math.round(company.shares_outstanding).toLocaleString('en-US')}M
                             </div>
                             ${company.shares_outstanding === 0 ? '<p style="font-size:0.75em;color:#ef4444;margin-top:5px;">❌ Missing!</p>' : ''}
                         </div>
@@ -1051,14 +1156,14 @@
                         <div class="result-card">
                             <div class="result-label">Net Debt</div>
                             <div class="result-value">
-                                $${(company.total_debt - company.cash).toFixed(2)}M
+                                ${formatMoney(company.total_debt - company.cash)}
                             </div>
                         </div>
 
                         <div class="result-card">
                             <div class="result-label">Debt-to-Equity Ratio</div>
                             <div class="result-value">
-                                ${company.shareholders_equity > 0 ? (company.total_debt / company.shareholders_equity).toFixed(2) : 'N/A'}
+                                ${company.shareholders_equity > 0 ? (company.total_debt / company.shareholders_equity).toFixed(2) + 'x' : 'N/A'}
                             </div>
                         </div>
 
@@ -1069,7 +1174,7 @@
 
                         <div class="result-card">
                             <div class="result-label">Market Cap</div>
-                            <div class="result-value">$${results.wacc_results.market_cap.toFixed(2)}M</div>
+                            <div class="result-value">${formatMoney(results.wacc_results.market_cap)}</div>
                         </div>
                     </div>
 
@@ -1079,7 +1184,7 @@
                         <div class="result-card ${results.historical_metrics.ttm_operating_cf > 0 ? 'positive' : 'negative'}">
                             <div class="result-label">Operating Cash Flow</div>
                             <div class="result-value ${results.historical_metrics.ttm_operating_cf > 0 ? 'positive' : 'negative'}">
-                                $${results.historical_metrics.ttm_operating_cf.toFixed(2)}M
+                                ${formatMoney(results.historical_metrics.ttm_operating_cf)}
                             </div>
                             ${results.historical_metrics.ttm_operating_cf === 0 ? '<p style="font-size:0.75em;color:#ef4444;margin-top:5px;">❌ Zero OCF!</p>' : ''}
                         </div>
@@ -1087,7 +1192,7 @@
                         <div class="result-card">
                             <div class="result-label">Capital Expenditures</div>
                             <div class="result-value">
-                                $${results.historical_metrics.ttm_capex.toFixed(2)}M
+                                ${formatMoney(results.historical_metrics.ttm_capex)}
                             </div>
                             ${results.historical_metrics.ttm_capex === 0 ? '<p style="font-size:0.75em;color:#f59e0b;margin-top:5px;">⚠️ No CapEx reported</p>' : ''}
                         </div>
@@ -1095,14 +1200,14 @@
                         <div class="result-card ${results.historical_metrics.ttm_fcf > 0 ? 'positive' : 'negative'}">
                             <div class="result-label">Free Cash Flow</div>
                             <div class="result-value ${results.historical_metrics.ttm_fcf > 0 ? 'positive' : 'negative'}">
-                                $${results.historical_metrics.ttm_fcf.toFixed(2)}M
+                                ${formatMoney(results.historical_metrics.ttm_fcf)}
                             </div>
                         </div>
 
                         <div class="result-card ${results.historical_metrics.ttm_net_income > 0 ? 'positive' : 'negative'}">
                             <div class="result-label">Net Income</div>
                             <div class="result-value ${results.historical_metrics.ttm_net_income > 0 ? 'positive' : 'negative'}">
-                                $${results.historical_metrics.ttm_net_income.toFixed(2)}M
+                                ${formatMoney(results.historical_metrics.ttm_net_income)}
                             </div>
                         </div>
                     </div>
