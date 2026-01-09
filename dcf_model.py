@@ -4,7 +4,7 @@ Enhanced Universal DCF Model with Multi-Source Data and Qualitative Analysis
 FIXED: Now properly fetches Balance Sheet data and validates data quality
 """
 
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, send_file
 from flask_cors import CORS
 import json
 from datetime import datetime, timedelta
@@ -14,12 +14,18 @@ from dotenv import load_dotenv
 import re
 from collections import Counter
 import yfinance as yf
+from excel_exporter import save_excel_report
+from excel_export import build_workbook_bytes
+from db import init_db, get_session
+from models import ValuationRun
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+init_db()
 
 # API Configuration
 ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
@@ -476,6 +482,63 @@ def fetch_from_yahoo(ticker: str):
     return company_data, historical_data, assumptions_hint, raw_financials
 
 
+def fetch_esg_data(ticker: str):
+    """
+    Fetch ESG data using yfinance.Ticker(ticker).sustainability.
+    Returns a normalized dict and never raises to caller.
+    """
+    normalized = {
+        "source": "yfinance",
+        "total_esg": None,
+        "environment_score": None,
+        "social_score": None,
+        "governance_score": None,
+        "controversy_level": None,
+        "raw": {}
+    }
+
+    try:
+        stock = yf.Ticker(ticker.upper().strip())
+        sustainability = stock.sustainability
+        if sustainability is None or sustainability.empty:
+            return normalized
+
+        def _get_score(key):
+            if key not in sustainability.index or sustainability.empty:
+                return None
+            try:
+                col = sustainability.columns[0]
+                value = sustainability.at[key, col]
+                return float(value) if value is not None else None
+            except Exception:
+                return None
+
+        total_esg = _get_score("totalEsg")
+        environment_score = _get_score("environmentScore")
+        social_score = _get_score("socialScore")
+        governance_score = _get_score("governanceScore")
+        controversy_level = _get_score("controversyLevel")
+
+        normalized.update({
+            "total_esg": total_esg,
+            "environment_score": environment_score,
+            "social_score": social_score,
+            "governance_score": governance_score,
+            "controversy_level": controversy_level,
+            "raw": {
+                "totalEsg": total_esg,
+                "environmentScore": environment_score,
+                "socialScore": social_score,
+                "governanceScore": governance_score,
+                "controversyLevel": controversy_level
+            }
+        })
+    except Exception as e:
+        normalized["raw"] = {"error": str(e)}
+
+    return normalized
+
+
 def fetch_company_and_cashflows(ticker: str):
     """
     Fetch company snapshot + cash flows + BALANCE SHEET data.
@@ -650,10 +713,11 @@ def fetch_company_and_cashflows(ticker: str):
 class DCFModel:
     """Comprehensive DCF Model Calculator with Enhanced Transparency"""
     
-    def __init__(self, company_data, historical_data, assumptions):
+    def __init__(self, company_data, historical_data, assumptions, esg_data=None):
         self.company = company_data
         self.historical = historical_data
         self.assumptions = assumptions
+        self.esg_data = esg_data or {}
         self.results = {}
         self.calculation_details = {}
     
@@ -665,6 +729,42 @@ class DCFModel:
         mrp = self.assumptions['market_risk_premium']
         
         cost_of_equity = rf + (beta * mrp)
+        ke_before_esg = cost_of_equity
+        ke_after_esg = cost_of_equity
+        esg_adjustment = 0.0
+
+        esg_enabled = self.assumptions.get('esg_adjustment_enabled', True)
+        esg_strength_bps = self.assumptions.get('esg_strength_bps', 50)
+        esg_good = self.assumptions.get('esg_threshold_good', 20)
+        esg_bad = self.assumptions.get('esg_threshold_bad', 40)
+        total_esg = self.esg_data.get('total_esg')
+
+        if esg_enabled and total_esg is not None and esg_bad > esg_good:
+            strength = esg_strength_bps / 10000
+            if total_esg <= esg_good:
+                esg_adjustment = -strength
+            elif total_esg >= esg_bad:
+                esg_adjustment = strength
+            else:
+                position = (total_esg - esg_good) / (esg_bad - esg_good)
+                esg_adjustment = (-strength) + (2 * strength * position)
+
+            ke_after_esg = cost_of_equity + esg_adjustment
+            ke_after_esg = max(ke_after_esg, rf, 0)
+            cost_of_equity = ke_after_esg
+
+        self.calculation_details['esg_adjustment'] = {
+            'score': total_esg,
+            'enabled': esg_enabled,
+            'thresholds': {
+                'good': esg_good,
+                'bad': esg_bad
+            },
+            'strength_bps': esg_strength_bps,
+            'ke_before': ke_before_esg,
+            'ke_after': ke_after_esg,
+            'adjustment': esg_adjustment
+        }
         
         shares = self.company['shares_outstanding']
         price = self.company['current_stock_price']
@@ -706,6 +806,8 @@ class DCFModel:
         return {
             'wacc': wacc,
             'cost_of_equity': cost_of_equity,
+            'ke_before_esg': ke_before_esg,
+            'ke_after_esg': ke_after_esg,
             'after_tax_cost_debt': after_tax_cost_debt,
             'equity_weight': equity_weight,
             'debt_weight': debt_weight,
@@ -772,6 +874,39 @@ class DCFModel:
             projected_fcf.append(fcf)
         
         return projected_fcf
+
+    def apply_stress_scenarios(self, projected_fcf):
+        """Apply stress scenarios to projected FCF without mutating base array."""
+        stress_enabled = self.assumptions.get('stress_enabled', False)
+        supply_chain_enabled = self.assumptions.get('stress_supply_chain', False)
+        carbon_tax_enabled = self.assumptions.get('stress_carbon_tax', False)
+
+        stressed_fcf = list(projected_fcf)
+        carbon_costs = [0.0 for _ in projected_fcf]
+        notes = []
+
+        if not stress_enabled:
+            return stressed_fcf, carbon_costs, notes
+
+        if supply_chain_enabled:
+            revenue_hit = self.assumptions.get('supply_chain_revenue_hit_pct', 0.15)
+            cogs_increase = self.assumptions.get('supply_chain_cogs_increase_pct', 0.10)
+            stress_multiplier = 1 - revenue_hit - cogs_increase
+            for i in range(min(2, len(stressed_fcf))):
+                stressed_fcf[i] = stressed_fcf[i] * stress_multiplier
+            notes.append("Supply chain shock applied to years 1-2.")
+
+        if carbon_tax_enabled:
+            carbon_intensity = self.assumptions.get('carbon_intensity', 0.02)
+            carbon_tax_rate = self.assumptions.get('carbon_tax_rate', 0.01)
+            for i, base_fcf in enumerate(projected_fcf):
+                revenue_proxy = base_fcf
+                carbon_cost = revenue_proxy * carbon_intensity * carbon_tax_rate
+                carbon_costs[i] = carbon_cost
+                stressed_fcf[i] = stressed_fcf[i] - carbon_cost
+            notes.append("Carbon tax uses FCF as revenue proxy for simplicity.")
+
+        return stressed_fcf, carbon_costs, notes
     
     def calculate_terminal_value(self, final_fcf, wacc):
         """Calculate terminal value using perpetual growth method."""
@@ -831,6 +966,50 @@ class DCFModel:
         
         irr = self.calculate_irr(projected_fcf, terminal_value, wacc_results['enterprise_value'])
         ev_fcf_multiple = wacc_results['enterprise_value'] / hist_metrics['ttm_fcf'] if hist_metrics['ttm_fcf'] > 0 else 0
+
+        stressed_projected_fcf, carbon_costs, stress_notes = self.apply_stress_scenarios(projected_fcf)
+        stress_enabled = self.assumptions.get('stress_enabled', False)
+        supply_chain_enabled = self.assumptions.get('stress_supply_chain', False)
+        carbon_tax_enabled = self.assumptions.get('stress_carbon_tax', False)
+
+        stressed_intrinsic_value_per_share = None
+        stressed_pv_fcf = []
+        stressed_terminal_value = 0
+        stressed_pv_terminal_value = 0
+
+        if stress_enabled and stressed_projected_fcf:
+            for year, fcf in enumerate(stressed_projected_fcf, 1):
+                pv = fcf / ((1 + wacc) ** year)
+                stressed_pv_fcf.append(pv)
+
+            stressed_terminal_value = self.calculate_terminal_value(stressed_projected_fcf[-1], wacc)
+            stressed_pv_terminal_value = stressed_terminal_value / ((1 + wacc) ** len(stressed_projected_fcf))
+
+            enterprise_value_stressed = sum(stressed_pv_fcf) + stressed_pv_terminal_value
+            equity_value_stressed = enterprise_value_stressed - self.company['total_debt'] + self.company['cash']
+            stressed_intrinsic_value_per_share = (
+                equity_value_stressed / self.company['shares_outstanding']
+                if self.company['shares_outstanding'] > 0 else 0
+            )
+
+        delta_pct = None
+        if stress_enabled and stressed_intrinsic_value_per_share is not None and intrinsic_value_per_share != 0:
+            delta_pct = ((stressed_intrinsic_value_per_share - intrinsic_value_per_share) / intrinsic_value_per_share) * 100
+
+        stress_test = {
+            "enabled": stress_enabled,
+            "scenarios": {
+                "supply_chain_shock": supply_chain_enabled,
+                "carbon_tax": carbon_tax_enabled
+            },
+            "base_intrinsic_value_per_share": intrinsic_value_per_share,
+            "stressed_intrinsic_value_per_share": stressed_intrinsic_value_per_share,
+            "delta_pct": delta_pct,
+            "base_projected_fcf": list(projected_fcf),
+            "stressed_projected_fcf": list(stressed_projected_fcf),
+            "carbon_costs": carbon_costs if carbon_tax_enabled else [],
+            "notes": stress_notes
+        }
         
         results = {
             'wacc_results': wacc_results,
@@ -846,6 +1025,7 @@ class DCFModel:
             'upside_pct': upside_pct,
             'irr': irr,
             'ev_fcf_multiple': ev_fcf_multiple,
+            'stress_test': stress_test,
             'calculation_details': self.calculation_details
         }
         
@@ -866,6 +1046,55 @@ class DCFModel:
             irr = 0
         
         return irr
+
+
+def persist_valuation_run(ticker, assumptions, results, quality_report, esg_data):
+    session = get_session()
+    try:
+        stress_test = results.get("stress_test", {}) if isinstance(results, dict) else {}
+        run = ValuationRun(
+            ticker=ticker,
+            assumptions_json=json.dumps(assumptions),
+            results_json=json.dumps(results),
+            intrinsic_value_per_share=results.get("intrinsic_value_per_share"),
+            stressed_intrinsic_value_per_share=stress_test.get("stressed_intrinsic_value_per_share"),
+            current_price=results.get("current_market_value"),
+            upside_pct=results.get("upside_pct"),
+            esg_total=(esg_data or {}).get("total_esg"),
+            data_quality=(quality_report or {}).get("quality")
+        )
+        session.add(run)
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        print(f"  Database write failed: {e}")
+    finally:
+        session.close()
+
+
+def get_default_assumptions(assumptions_hint=None):
+    hint = assumptions_hint or {}
+    return {
+        'tax_rate': 0.21,
+        'risk_free_rate': 0.045,
+        'market_risk_premium': 0.08,
+        'beta': hint.get('beta', 1.15),
+        'cost_of_debt': 0.05,
+        'perpetual_growth_rate': 0.025,
+        'revenue_growth_rates': [0.06, 0.055, 0.05, 0.045, 0.04],
+        'forecast_years': 5,
+        'esg_adjustment_enabled': True,
+        'esg_strength_bps': 50,
+        'esg_threshold_good': 20,
+        'esg_threshold_bad': 40,
+        'stress_enabled': False,
+        'stress_supply_chain': False,
+        'stress_carbon_tax': False,
+        'supply_chain_revenue_hit_pct': 0.15,
+        'supply_chain_cogs_increase_pct': 0.10,
+        'carbon_intensity': 0.02,
+        'carbon_tax_rate': 0.01
+    }
 
 
 # --- FLASK ROUTES ---
@@ -929,9 +1158,13 @@ def analyze_ticker():
         if quality_report['warnings']:
             for warning in quality_report['warnings']:
                 print(f"    {warning}")
+
+        # Fetch ESG data
+        print(f"\n[2/5] Fetching ESG data...")
+        esg_data = fetch_esg_data(ticker)
         
-        # 2. Scrape Reddit sentiment
-        print(f"\n[2/4] Scraping Reddit for community sentiment...")
+        # 3. Scrape Reddit sentiment
+        print(f"\n[3/5] Scraping Reddit for community sentiment...")
         reddit_data = {}
         try:
             scraper = RedditScraper()
@@ -947,8 +1180,8 @@ def analyze_ticker():
                 'error': str(e)
             }
         
-        # 3. Fetch news articles
-        print(f"\n[3/4] Fetching recent news articles...")
+        # 4. Fetch news articles
+        print(f"\n[4/5] Fetching recent news articles...")
         news_data = {}
         try:
             if NEWS_API_KEY:
@@ -977,24 +1210,15 @@ def analyze_ticker():
                 'error': str(e)
             }
         
-        # 4. Calculate DCF valuation
-        print(f"\n[4/4] Calculating DCF valuation...")
-        default_assumptions = {
-            'tax_rate': 0.21,
-            'risk_free_rate': 0.045,
-            'market_risk_premium': 0.08,
-            'beta': assumptions_hint.get('beta', 1.15),
-            'cost_of_debt': 0.05,
-            'perpetual_growth_rate': 0.025,
-            'revenue_growth_rates': [0.06, 0.055, 0.05, 0.045, 0.04],
-            'forecast_years': 5
-        }
+        # 5. Calculate DCF valuation
+        print(f"\n[5/5] Calculating DCF valuation...")
+        default_assumptions = get_default_assumptions(assumptions_hint)
         
         user_assumptions = data.get('assumptions', {})
         assumptions = {**default_assumptions, **user_assumptions}
         
         try:
-            model = DCFModel(company_data, historical_data, assumptions)
+            model = DCFModel(company_data, historical_data, assumptions, esg_data=esg_data)
             results = model.calculate_dcf_valuation()
             print(f"✓ DCF calculation completed")
         except Exception as e:
@@ -1010,7 +1234,14 @@ def analyze_ticker():
         results['news_analysis'] = news_data
         results['data_quality'] = quality_report
         results['raw_financials'] = raw_financials
-        
+        results['esg'] = esg_data
+
+        # Generate Excel report
+        excel_file = save_excel_report(ticker, results)
+        results['excel_file_path'] = excel_file
+
+        persist_valuation_run(ticker, assumptions, results, quality_report, esg_data)
+
         print(f"\n{'='*60}")
         print(f"Analysis complete!")
         print(f"Intrinsic Value: ${results['intrinsic_value_per_share']:.2f}")
@@ -1040,17 +1271,90 @@ def get_defaults():
     """Get default values"""
     defaults = {
         'assumptions': {
-            'tax_rate': 0.21,
-            'risk_free_rate': 0.045,
-            'market_risk_premium': 0.08,
-            'beta': 1.15,
-            'cost_of_debt': 0.05,
-            'perpetual_growth_rate': 0.025,
-            'revenue_growth_rates': [0.06, 0.055, 0.05, 0.045, 0.04],
-            'forecast_years': 5
+            **get_default_assumptions()
         }
     }
     return jsonify(defaults)
+
+
+@app.route('/api/export_excel', methods=['POST'])
+def export_excel():
+    """Generate a downloadable Excel model."""
+    try:
+        data = request.json or {}
+        results = data.get('results')
+        ticker = data.get('ticker', '').strip().upper()
+
+        if results:
+            ticker = ticker or results.get('company_data', {}).get('ticker', 'MODEL')
+        else:
+            if not ticker:
+                return jsonify({'success': False, 'error': 'Ticker is required'}), 400
+
+            user_assumptions = data.get('assumptions', {})
+            company_data, historical_data, assumptions_hint, raw_financials = fetch_company_and_cashflows(ticker)
+            esg_data = fetch_esg_data(ticker)
+            assumptions = {**get_default_assumptions(assumptions_hint), **user_assumptions}
+
+            model = DCFModel(company_data, historical_data, assumptions, esg_data=esg_data)
+            results = model.calculate_dcf_valuation()
+            results['company_data'] = company_data
+            results['historical_data'] = historical_data
+            results['assumptions'] = assumptions
+            results['raw_financials'] = raw_financials
+            results['esg'] = esg_data
+
+        buffer = build_workbook_bytes(ticker, results)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        filename = f"DCF_{ticker}_{timestamp}.xlsx"
+
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=filename,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/history')
+def get_history():
+    """Return recent valuation runs."""
+    ticker = request.args.get('ticker', '').strip().upper()
+    limit = request.args.get('limit', 20)
+
+    try:
+        limit = max(1, min(int(limit), 100))
+    except ValueError:
+        limit = 20
+
+    session = get_session()
+    try:
+        query = session.query(ValuationRun).order_by(ValuationRun.created_at.desc())
+        if ticker:
+            query = query.filter(ValuationRun.ticker == ticker)
+        runs = query.limit(limit).all()
+
+        payload = []
+        for run in runs:
+            payload.append({
+                'id': run.id,
+                'created_at': run.created_at.isoformat(),
+                'ticker': run.ticker,
+                'intrinsic_value_per_share': run.intrinsic_value_per_share,
+                'stressed_intrinsic_value_per_share': run.stressed_intrinsic_value_per_share,
+                'current_price': run.current_price,
+                'upside_pct': run.upside_pct,
+                'esg_total': run.esg_total,
+                'data_quality': run.data_quality
+            })
+
+        return jsonify({'success': True, 'results': payload})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        session.close()
 
 
 if __name__ == '__main__':

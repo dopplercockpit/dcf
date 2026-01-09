@@ -7,6 +7,10 @@ A web-based Discounted Cash Flow (DCF) analysis tool that automatically fetches 
 - **One-click analysis**: Enter a ticker symbol and get complete DCF valuation
 - **Automatic data fetching**: Company financials, stock price, and cash flow data from Alpha Vantage
 - **Professional calculations**: WACC, projected cash flows, terminal value, and intrinsic value
+- **ESG-adjusted WACC**: Optional green discounting with ESG score visibility
+- **Resilience stress testing**: Supply chain and carbon tax scenarios
+- **Excel export**: Download a working .xlsx model
+- **Run history**: Persist analyses to SQLite for later review
 - **Buy/Sell/Hold recommendations**: Based on market vs intrinsic value comparison
 - **Customizable assumptions**: Override default values for advanced analysis
 
@@ -119,6 +123,37 @@ If empty, set it following Step 3 above.
 - `GET /api/alpha_vantage?ticker=AAPL` - Fetch raw company data
 - `POST /api/calculate` - Calculate DCF with provided data
 - `GET /api/defaults` - Get default assumptions
+- `POST /api/export_excel` - Generate Excel model (ticker + assumptions or results)
+- `GET /api/history?ticker=AAPL&limit=20` - Recent valuation runs
+
+## Smoke Tests
+
+Run these after installing dependencies and setting `ALPHAVANTAGE_API_KEY`:
+
+1) Start the server:
+```bash
+python dcf_model.py
+```
+
+2) Analyze a ticker:
+```bash
+curl -X POST http://localhost:5000/api/analyze -H "Content-Type: application/json" -d "{\"ticker\":\"AAPL\"}"
+```
+
+3) Analyze with ESG and stress:
+```bash
+curl -X POST http://localhost:5000/api/analyze -H "Content-Type: application/json" -d "{\"ticker\":\"AAPL\",\"assumptions\":{\"esg_adjustment_enabled\":true,\"esg_strength_bps\":50,\"stress_enabled\":true,\"stress_supply_chain\":true,\"stress_carbon_tax\":true,\"carbon_intensity\":0.02,\"carbon_tax_rate\":0.01}}"
+```
+
+4) Export Excel (ticker + assumptions):
+```bash
+curl -X POST http://localhost:5000/api/export_excel -H "Content-Type: application/json" -d "{\"ticker\":\"AAPL\"}" --output DCF_AAPL.xlsx
+```
+
+5) Check history:
+```bash
+curl "http://localhost:5000/api/history?ticker=AAPL&limit=5"
+```
 
 ## Example Usage
 

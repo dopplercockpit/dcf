@@ -115,6 +115,11 @@
             transition: all 0.3s;
         }
 
+        .input-group input[type="checkbox"] {
+            width: auto;
+            margin-right: 8px;
+        }
+
         .input-group input:focus {
             outline: none;
             border-color: #667eea;
@@ -578,6 +583,32 @@
             color: #666;
             margin-top: 5px;
         }
+
+        .input-subsection {
+            margin-top: 20px;
+            padding: 20px;
+            background: white;
+            border-radius: 12px;
+            border: 1px solid #e0e0e0;
+        }
+
+        .input-subsection h3 {
+            color: #1e3c72;
+            margin-bottom: 15px;
+            font-size: 1.2em;
+        }
+
+        .input-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 15px;
+        }
+
+        .range-value {
+            font-weight: 600;
+            color: #1e3c72;
+            margin-left: 8px;
+        }
     </style>
 </head>
 <body>
@@ -610,6 +641,58 @@
                         </button>
                     </div>
                 </div>
+
+                <div class="input-subsection">
+                    <h3>Sustainable Finance (ESG)</h3>
+                    <div class="input-grid">
+                        <div class="input-group">
+                        <label>
+                            <input type="checkbox" id="esg-enabled" checked>
+                            Enable ESG Adjustment
+                        </label>
+                        <p class="help-text">Apply a green discounting adjustment to cost of equity.</p>
+                    </div>
+                    <div class="input-group">
+                        <label for="esg-strength-bps">
+                            ESG Strength (bps)
+                            <span class="range-value" id="esg-strength-value">50</span>
+                        </label>
+                        <input type="range" id="esg-strength-bps" min="0" max="150" value="50">
+                    </div>
+                    </div>
+                </div>
+
+                <div class="input-subsection">
+                    <h3>Resilience Stress Test</h3>
+                    <div class="input-grid">
+                        <div class="input-group">
+                        <label>
+                            <input type="checkbox" id="stress-enabled">
+                            Enable Stress Test
+                        </label>
+                    </div>
+                    <div class="input-group">
+                        <label>
+                            <input type="checkbox" id="stress-supply-chain">
+                            Supply Chain Shock
+                        </label>
+                    </div>
+                    <div class="input-group">
+                        <label>
+                            <input type="checkbox" id="stress-carbon-tax">
+                            Carbon Tax
+                        </label>
+                    </div>
+                    <div class="input-group">
+                        <label>Carbon Intensity</label>
+                        <input type="number" id="carbon-intensity" value="0.02" step="0.01" min="0" max="1">
+                    </div>
+                    <div class="input-group">
+                        <label>Carbon Tax Rate</label>
+                        <input type="number" id="carbon-tax-rate" value="0.01" step="0.01" min="0" max="1">
+                    </div>
+                    </div>
+                </div>
             </div>
 
             <!-- Loading Indicator -->
@@ -639,6 +722,9 @@
                 </div>
 
                 <div style="text-align: center; margin-top: 30px;">
+                    <button class="button" onclick="downloadExcel()" style="width: auto; padding: 15px 40px; margin-right: 10px;">
+                        Download Excel
+                    </button>
                     <button class="button" onclick="resetAnalysis()" style="width: auto; padding: 15px 40px;">
                         🔄 Analyze Another Stock
                     </button>
@@ -657,6 +743,8 @@
             }, 5000);
         }
 
+        let latestResults = null;
+
         async function analyzeStock() {
             const ticker = document.getElementById('ticker').value.trim().toUpperCase();
 
@@ -664,6 +752,24 @@
                 showAlert('Please enter a ticker symbol');
                 return;
             }
+
+            const esgEnabled = document.getElementById('esg-enabled').checked;
+            const esgStrength = parseFloat(document.getElementById('esg-strength-bps').value);
+            const stressEnabled = document.getElementById('stress-enabled').checked;
+            const stressSupplyChain = document.getElementById('stress-supply-chain').checked;
+            const stressCarbonTax = document.getElementById('stress-carbon-tax').checked;
+            const carbonIntensity = parseFloat(document.getElementById('carbon-intensity').value);
+            const carbonTaxRate = parseFloat(document.getElementById('carbon-tax-rate').value);
+
+            const assumptions = {
+                esg_adjustment_enabled: esgEnabled,
+                esg_strength_bps: isNaN(esgStrength) ? 50 : esgStrength,
+                stress_enabled: stressEnabled,
+                stress_supply_chain: stressSupplyChain,
+                stress_carbon_tax: stressCarbonTax,
+                carbon_intensity: isNaN(carbonIntensity) ? 0.02 : carbonIntensity,
+                carbon_tax_rate: isNaN(carbonTaxRate) ? 0.01 : carbonTaxRate
+            };
 
             // Show loading, hide input and results
             document.getElementById('input-section').style.display = 'none';
@@ -678,7 +784,8 @@
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        ticker: ticker
+                        ticker: ticker,
+                        assumptions: assumptions
                     })
                 });
 
@@ -690,6 +797,7 @@
                 const data = await response.json();
 
                 if (data.success) {
+                    latestResults = data.results;
                     displayResults(data.results);
                     displaySentimentFeed(data.results);
                     document.getElementById('results-section').classList.add('active');
@@ -712,6 +820,42 @@
             document.getElementById('input-section').style.display = 'block';
             document.getElementById('ticker').value = '';
             document.getElementById('ticker').focus();
+            latestResults = null;
+        }
+
+        async function downloadExcel() {
+            if (!latestResults) {
+                showAlert('Run an analysis first.');
+                return;
+            }
+
+            try {
+                const response = await fetch('http://localhost:5000/api/export_excel', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        results: latestResults
+                    })
+                });
+
+                if (!response.ok) {
+                    const text = await response.text();
+                    throw new Error(`Server returned ${response.status}: ${text.substring(0, 200)}`);
+                }
+
+                const blob = await response.blob();
+                const ticker = latestResults.company_data?.ticker || 'MODEL';
+                const link = document.createElement('a');
+                link.href = window.URL.createObjectURL(blob);
+                link.download = `DCF_${ticker}.xlsx`;
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+            } catch (error) {
+                showAlert('Error exporting Excel: ' + error.message);
+            }
         }
 
         // SEC-style number formatting helpers
@@ -848,6 +992,87 @@
             const company = results.company_data;
             const upside = results.upside_pct;
             const details = results.calculation_details || {};
+            const esg = results.esg || {};
+            const stress = results.stress_test || {};
+
+            const esgScore = esg.total_esg;
+            const hasEsg = esgScore !== null && esgScore !== undefined;
+            const esgHtml = hasEsg ? `
+                <div class="section">
+                    <h2 class="section-title">Sustainable Finance (ESG)</h2>
+                    <div class="results-grid">
+                        <div class="result-card">
+                            <div class="result-label">Total ESG Score</div>
+                            <div class="result-value">${esg.total_esg.toFixed(1)}</div>
+                        </div>
+                        <div class="result-card">
+                            <div class="result-label">Environment</div>
+                            <div class="result-value">${esg.environment_score !== null && esg.environment_score !== undefined ? esg.environment_score.toFixed(1) : 'N/A'}</div>
+                        </div>
+                        <div class="result-card">
+                            <div class="result-label">Social</div>
+                            <div class="result-value">${esg.social_score !== null && esg.social_score !== undefined ? esg.social_score.toFixed(1) : 'N/A'}</div>
+                        </div>
+                        <div class="result-card">
+                            <div class="result-label">Governance</div>
+                            <div class="result-value">${esg.governance_score !== null && esg.governance_score !== undefined ? esg.governance_score.toFixed(1) : 'N/A'}</div>
+                        </div>
+                        <div class="result-card">
+                            <div class="result-label">Controversy</div>
+                            <div class="result-value">${esg.controversy_level !== null && esg.controversy_level !== undefined ? esg.controversy_level.toFixed(1) : 'N/A'}</div>
+                        </div>
+                        <div class="result-card">
+                            <div class="result-label">Ke Before/After ESG</div>
+                            <div class="result-value">
+                                ${(results.wacc_results.ke_before_esg * 100).toFixed(1)}% -> ${(results.wacc_results.ke_after_esg * 100).toFixed(1)}%
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            ` : '';
+
+            const stressBase = stress.base_intrinsic_value_per_share !== null && stress.base_intrinsic_value_per_share !== undefined
+                ? stress.base_intrinsic_value_per_share
+                : results.intrinsic_value_per_share;
+            const stressValue = stress.stressed_intrinsic_value_per_share !== null && stress.stressed_intrinsic_value_per_share !== undefined
+                ? stress.stressed_intrinsic_value_per_share
+                : stressBase;
+            const stressDelta = stress.delta_pct;
+
+            const stressHtml = stress.enabled ? `
+                <div class="section">
+                    <h2 class="section-title">Resilience Stress Test</h2>
+                    <div class="comparison">
+                        <div class="comparison-item">
+                            <div class="comparison-label">Base Intrinsic Value</div>
+                            <div class="comparison-value">$${stressBase.toFixed(2)}</div>
+                        </div>
+                        <div class="arrow ${stressDelta < 0 ? 'down' : 'up'}">
+                            ${stressDelta < 0 ? 'v' : '^'}
+                        </div>
+                        <div class="comparison-item">
+                            <div class="comparison-label">Stressed Intrinsic Value</div>
+                            <div class="comparison-value">$${stressValue.toFixed(2)}</div>
+                        </div>
+                    </div>
+                    <div class="results-grid">
+                        <div class="result-card">
+                            <div class="result-label">Delta</div>
+                            <div class="result-value ${stressDelta < 0 ? 'negative' : 'positive'}">
+                                ${stressDelta !== null && stressDelta !== undefined ? stressDelta.toFixed(1) + '%' : 'N/A'}
+                            </div>
+                        </div>
+                        <div class="result-card">
+                            <div class="result-label">Supply Chain Shock</div>
+                            <div class="result-value">${stress.scenarios.supply_chain_shock ? 'On' : 'Off'}</div>
+                        </div>
+                        <div class="result-card">
+                            <div class="result-label">Carbon Tax</div>
+                            <div class="result-value">${stress.scenarios.carbon_tax ? 'On' : 'Off'}</div>
+                        </div>
+                    </div>
+                </div>
+            ` : '';
 
             // Determine recommendation
             let recommendation, returnText, arrowHTML, arrowClass;
@@ -1019,6 +1244,9 @@
                         <p><strong>TTM Net Income:</strong> ${formatMoney(results.historical_metrics.ttm_net_income)}</p>
                     </div>
                 </div>
+
+                ${esgHtml}
+                ${stressHtml}
 
                 <div class="section">
                     <h2 class="section-title">🔮 Projected Free Cash Flows (5-Year Forecast)</h2>
@@ -1364,6 +1592,15 @@
                 analyzeStock();
             }
         });
+
+        const esgStrengthInput = document.getElementById('esg-strength-bps');
+        const esgStrengthValue = document.getElementById('esg-strength-value');
+        if (esgStrengthInput && esgStrengthValue) {
+            esgStrengthValue.textContent = esgStrengthInput.value;
+            esgStrengthInput.addEventListener('input', function(e) {
+                esgStrengthValue.textContent = e.target.value;
+            });
+        }
 
         // Focus on ticker input on load
         window.onload = function() {
