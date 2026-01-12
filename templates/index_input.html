@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="api-base" content="http://127.0.0.1:5000">
     <title>Enhanced DCF Model - Educational Analysis Tool</title>
     <style>
         * {
@@ -744,6 +745,14 @@
         }
 
         let latestResults = null;
+        const API_BASE = (document.querySelector('meta[name="api-base"]')?.content || '').replace(/\/$/, '');
+
+        function apiUrl(path) {
+            if (!API_BASE) {
+                return path;
+            }
+            return `${API_BASE}${path}`;
+        }
 
         async function analyzeStock() {
             const ticker = document.getElementById('ticker').value.trim().toUpperCase();
@@ -778,7 +787,7 @@
             document.getElementById('analyze-btn').disabled = true;
 
             try {
-                const response = await fetch('http://localhost:5000/api/analyze', {
+                const response = await fetch(apiUrl('/api/analyze'), {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -830,7 +839,7 @@
             }
 
             try {
-                const response = await fetch('http://localhost:5000/api/export_excel', {
+                const response = await fetch(apiUrl('/api/export_excel'), {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
