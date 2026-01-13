@@ -19,6 +19,7 @@ from werkzeug.exceptions import HTTPException
 from excel_exporter import save_excel_report
 from excel_export import build_workbook_bytes
 from caching_layer import cache_response
+from run_log import start_run, log_event, get_run_log, summarize_run_log
 from db import init_db, get_session, check_db_health
 from models import ValuationRun
 from show_your_work import generate_calculation_walkthrough
@@ -300,9 +301,26 @@ class NewsAnalyzer:
             except ValueError:
                 error_message = response.text
             print(f"Error fetching news: {response.status_code} {error_message}")
+            log_event(
+                "warning",
+                "NEWS",
+                "News API request failed",
+                source="NewsAPI",
+                code=response.status_code,
+                action="news_fetch_failed",
+                meta={"details": error_message}
+            )
             
         except Exception as e:
             print(f"Error fetching news: {e}")
+            log_event(
+                "warning",
+                "NEWS",
+                "News API request failed",
+                source="NewsAPI",
+                action="news_fetch_failed",
+                exception=e
+            )
         
         return []
     
@@ -538,6 +556,7 @@ class ESGDataFetcher:
 
     def __init__(self, fmp_api_key=None):
         self.fmp_api_key = fmp_api_key
+        self._last_error = None
         self.sector_baselines = {
             "technology": {"total": 45, "env": 50, "social": 45, "gov": 40},
             "financial": {"total": 50, "env": 45, "social": 50, "gov": 55},
@@ -548,25 +567,102 @@ class ESGDataFetcher:
             "default": {"total": 45, "env": 45, "social": 45, "gov": 45}
         }
 
+    def _set_last_error(self, source, message, code=None):
+        self._last_error = {"source": source, "message": message, "code": code}
+
+    def _consume_last_error(self):
+        error = self._last_error
+        self._last_error = None
+        return error
+
+    def _log_source_attempt(self, source):
+        log_event(
+            "info",
+            "ESG",
+            f"Attempting ESG source: {source}",
+            source=source,
+            action="esg_source_attempt"
+        )
+
+    def _log_source_failure(self, source, fallback_action=None):
+        error = self._consume_last_error()
+        message = error.get("message") if error else "No ESG data returned"
+        code = error.get("code") if error else None
+        log_event(
+            "warning",
+            "ESG",
+            message,
+            source=source,
+            code=code,
+            action=fallback_action or "esg_source_failed",
+            meta={"source": source}
+        )
+
+    def _log_source_selected(self, source, meta=None):
+        log_event(
+            "info",
+            "ESG",
+            f"ESG source selected: {source}",
+            source=source,
+            action="esg_source_selected",
+            meta=meta
+        )
+
     def fetch_esg_data(self, ticker: str, company_name: str = "", sector: str = ""):
         ticker = ticker.upper().strip()
 
+        self._log_source_attempt("FMP")
         fmp_data = self._fetch_from_fmp(ticker)
         if fmp_data:
+            self._log_source_selected(
+                "FMP",
+                meta={
+                    "confidence": fmp_data.get("confidence"),
+                    "is_estimated": fmp_data.get("is_estimated")
+                }
+            )
             return fmp_data
+        self._log_source_failure("FMP", fallback_action="fallback_to_yahoo")
 
+        self._log_source_attempt("yfinance")
         yahoo_data = self._fetch_from_yahoo(ticker)
         if yahoo_data:
+            self._log_source_selected(
+                "yfinance",
+                meta={
+                    "confidence": yahoo_data.get("confidence"),
+                    "is_estimated": yahoo_data.get("is_estimated")
+                }
+            )
             return yahoo_data
+        self._log_source_failure("yfinance", fallback_action="fallback_to_news_estimate")
 
+        self._log_source_attempt("News-based estimate")
         estimate = self._estimate_from_news(ticker, company_name)
         if estimate:
+            self._log_source_selected(
+                "News-based estimate",
+                meta={
+                    "confidence": estimate.get("confidence"),
+                    "is_estimated": estimate.get("is_estimated")
+                }
+            )
             return estimate
+        self._log_source_failure("News-based estimate", fallback_action="fallback_to_sector_baseline")
 
-        return self._sector_baseline(sector)
+        baseline = self._sector_baseline(sector)
+        self._log_source_selected(
+            baseline.get("source", "Sector baseline"),
+            meta={
+                "confidence": baseline.get("confidence"),
+                "is_estimated": baseline.get("is_estimated")
+            }
+        )
+        return baseline
 
     def _fetch_from_fmp(self, ticker: str):
         if not self.fmp_api_key:
+            self._set_last_error("FMP", "FMP_API_KEY is not configured")
             return None
 
         try:
@@ -574,10 +670,12 @@ class ESGDataFetcher:
             params = {"symbol": ticker, "apikey": self.fmp_api_key}
             response = requests.get(url, params=params, timeout=10)
             if response.status_code != 200:
+                self._set_last_error("FMP", response.text, code=response.status_code)
                 return None
 
             data = response.json()
             if not data or not isinstance(data, list):
+                self._set_last_error("FMP", "FMP ESG response was empty")
                 return None
 
             latest = data[0]
@@ -587,6 +685,7 @@ class ESGDataFetcher:
             governance_score = _parse_esg_score(latest.get("governanceScore"))
 
             if total_esg is None:
+                self._set_last_error("FMP", "FMP ESG score missing")
                 return None
 
             return {
@@ -601,7 +700,8 @@ class ESGDataFetcher:
                 "last_updated": latest.get("date"),
                 "raw": latest
             }
-        except Exception:
+        except Exception as e:
+            self._set_last_error("FMP", str(e))
             return None
 
     def _fetch_from_yahoo(self, ticker: str):
@@ -609,6 +709,7 @@ class ESGDataFetcher:
             stock = yf.Ticker(ticker)
             sustainability = stock.sustainability
             if sustainability is None or sustainability.empty:
+                self._set_last_error("yfinance", "No Yahoo Finance ESG data available")
                 return None
 
             def _get_score(key):
@@ -628,6 +729,7 @@ class ESGDataFetcher:
             controversy_level = _get_score("controversyLevel")
 
             if total_esg is None:
+                self._set_last_error("yfinance", "Yahoo Finance ESG score missing")
                 return None
 
             return {
@@ -647,17 +749,22 @@ class ESGDataFetcher:
                     "controversyLevel": controversy_level
                 }
             }
-        except Exception:
+        except Exception as e:
+            message = str(e)
+            code = 404 if "404" in message else None
+            self._set_last_error("yfinance", message, code=code)
             return None
 
     def _estimate_from_news(self, ticker: str, company_name: str):
         if not NEWS_API_KEY:
+            self._set_last_error("News-based estimate", "NEWS_API_KEY is not configured")
             return None
 
         query_name = company_name or ticker
         analyzer = NewsAnalyzer(NEWS_API_KEY)
         articles = analyzer.fetch_company_news(query_name, ticker, days=180)
         if not articles:
+            self._set_last_error("News-based estimate", "No news articles available for ESG estimate")
             return None
 
         esg_keywords = [
@@ -752,46 +859,141 @@ def fetch_company_and_cashflows(ticker: str):
             import time
 
             print(f"  📊 Fetching OVERVIEW...")
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "Requesting OVERVIEW",
+                source="AlphaVantage",
+                action="request_start",
+                meta={"endpoint": "OVERVIEW"}
+            )
             overview = _call_alpha_vantage({
                 "function": "OVERVIEW",
                 "symbol": ticker
             })
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "OVERVIEW fetched",
+                source="AlphaVantage",
+                action="request_success",
+                meta={"endpoint": "OVERVIEW"}
+            )
             time.sleep(1)  # Delay to avoid rate limiting
 
             print(f"  💰 Fetching QUOTE...")
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "Requesting GLOBAL_QUOTE",
+                source="AlphaVantage",
+                action="request_start",
+                meta={"endpoint": "GLOBAL_QUOTE"}
+            )
             quote = _call_alpha_vantage({
                 "function": "GLOBAL_QUOTE",
                 "symbol": ticker
             })
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "GLOBAL_QUOTE fetched",
+                source="AlphaVantage",
+                action="request_success",
+                meta={"endpoint": "GLOBAL_QUOTE"}
+            )
             time.sleep(1)
 
             print(f"  💸 Fetching CASH_FLOW...")
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "Requesting CASH_FLOW",
+                source="AlphaVantage",
+                action="request_start",
+                meta={"endpoint": "CASH_FLOW"}
+            )
             cash_flow = _call_alpha_vantage({
                 "function": "CASH_FLOW",
                 "symbol": ticker
             })
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "CASH_FLOW fetched",
+                source="AlphaVantage",
+                action="request_success",
+                meta={"endpoint": "CASH_FLOW"}
+            )
             time.sleep(1)
 
             # THE FIX: Fetch balance sheet for accurate Cash and Debt!
             print(f"  🏦 Fetching BALANCE_SHEET...")
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "Requesting BALANCE_SHEET",
+                source="AlphaVantage",
+                action="request_start",
+                meta={"endpoint": "BALANCE_SHEET"}
+            )
             balance_sheet = _call_alpha_vantage({
                 "function": "BALANCE_SHEET",
                 "symbol": ticker
             })
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "BALANCE_SHEET fetched",
+                source="AlphaVantage",
+                action="request_success",
+                meta={"endpoint": "BALANCE_SHEET"}
+            )
             time.sleep(1)
 
             # Also fetch income statement for additional validation
             print(f"  📈 Fetching INCOME_STATEMENT...")
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "Requesting INCOME_STATEMENT",
+                source="AlphaVantage",
+                action="request_start",
+                meta={"endpoint": "INCOME_STATEMENT"}
+            )
             income_statement = _call_alpha_vantage({
                 "function": "INCOME_STATEMENT",
                 "symbol": ticker
             })
+            log_event(
+                "info",
+                "ALPHAVANTAGE",
+                "INCOME_STATEMENT fetched",
+                source="AlphaVantage",
+                action="request_success",
+                meta={"endpoint": "INCOME_STATEMENT"}
+            )
         except Exception as e:
             print(f"  ⚠️ Alpha Vantage failed: {e}")
             print(f"  🔄 Falling back to Yahoo Finance...")
+            log_event(
+                'warning',
+                'ALPHAVANTAGE',
+                'Alpha Vantage failed, falling back to Yahoo Finance',
+                source='AlphaVantage',
+                action='fallback_to_yahoo',
+                exception=e
+            )
             return fetch_from_yahoo(ticker)
     else:
         print(f"  ℹ️ No Alpha Vantage API key, using Yahoo Finance...")
+        log_event(
+            'error',
+            'ALPHAVANTAGE',
+            'ALPHAVANTAGE_API_KEY is not configured, using Yahoo Finance',
+            source='AlphaVantage',
+            action='fallback_to_yahoo'
+        )
         return fetch_from_yahoo(ticker)
     
     def _to_millions(value):
@@ -899,6 +1101,7 @@ def fetch_company_and_cashflows(ticker: str):
     # Add raw financial statement data for debugging/display
     raw_financials = {
         "balance_sheet_date": latest_bs.get("fiscalDateEnding", "N/A"),
+        "source": "Alpha Vantage",
         "raw_data": {
             "cash_from_bs": raw_cash,
             "debt_from_bs": raw_debt,
@@ -1487,8 +1690,17 @@ def analyze_ticker():
     """
     Comprehensive analysis endpoint with data quality validation
     """
+    start_run()
     try:
         if not ALPHAVANTAGE_API_KEY:
+            log_event(
+                "error",
+                "ALPHAVANTAGE",
+                "ALPHAVANTAGE_API_KEY is not configured",
+                source="AlphaVantage",
+                action="missing_api_key",
+                fatal=True
+            )
             return jsonify({
                 'success': False,
                 'error': 'Alpha Vantage API key is not configured.'
@@ -1508,27 +1720,70 @@ def analyze_ticker():
                 'success': False,
                 'error': 'Ticker symbol is required'
             }), 400
+
+        log_event(
+            "info",
+            "RUN",
+            f"Starting analysis for {ticker}",
+            action="run_start",
+            meta={"ticker": ticker}
+        )
         
         print(f"\n{'='*60}")
         print(f"Starting comprehensive analysis for {ticker}")
         print(f"{'='*60}\n")
         
         # 1. Fetch financial data from Alpha Vantage
+        log_event(
+            "info",
+            "RUN",
+            "Phase 1: Fetch financial data",
+            action="phase_start",
+            meta={"phase": 1, "name": "financial_data"}
+        )
         print(f"[1/4] Fetching financial data from Alpha Vantage...")
         try:
             company_data, historical_data, assumptions_hint, raw_financials = fetch_company_and_cashflows(ticker)
             print(f"✓ Financial data fetched successfully")
+            log_event(
+                'info',
+                'RUN',
+                'Financial data fetched',
+                action='financial_data_fetched',
+                meta={'source': raw_financials.get('source')}
+            )
             print(f"  Cash: ${company_data['cash']:.2f}M")
             print(f"  Debt: ${company_data['total_debt']:.2f}M")
             print(f"  Shares: {company_data['shares_outstanding']:.2f}M")
         except Exception as e:
             error_msg = f'Failed to fetch financial data: {str(e)}'
+            log_event(
+                'error',
+                'RUN',
+                error_msg,
+                action='financial_data_failed',
+                exception=e,
+                fatal=True
+            )
             print(f"✗ {error_msg}")
             return jsonify({'success': False, 'error': error_msg}), 400
         
         # CHECK DATA QUALITY
         print(f"\n📋 Checking data quality...")
+        log_event(
+            'info',
+            'RUN',
+            'Phase 1b: Data quality check',
+            action='data_quality_start'
+        )
         quality_report = DataQualityChecker.get_data_quality_report(company_data, historical_data)
+        log_event(
+            'info',
+            'RUN',
+            'Data quality evaluated',
+            action='data_quality_complete',
+            meta={'quality': quality_report.get('quality')}
+        )
         print(f"  Quality: {quality_report['quality_emoji']} {quality_report['quality']}")
         if quality_report['issues']:
             for issue in quality_report['issues']:
@@ -1539,6 +1794,13 @@ def analyze_ticker():
 
         # Fetch ESG data
         print(f"\n[2/5] Fetching ESG data...")
+        log_event(
+            'info',
+            'RUN',
+            'Phase 2: esg processing',
+            action='phase_start',
+            meta={'phase': 2, 'name': 'esg'}
+        )
         esg_data = fetch_esg_data(
             ticker,
             company_name=company_data.get("company_name", ""),
@@ -1547,6 +1809,13 @@ def analyze_ticker():
         
         # 3. Scrape Reddit sentiment
         print(f"\n[3/5] Scraping Reddit for community sentiment...")
+        log_event(
+            'info',
+            'RUN',
+            'Phase 3: reddit processing',
+            action='phase_start',
+            meta={'phase': 3, 'name': 'reddit'}
+        )
         reddit_data = {}
         try:
             scraper = RedditScraper()
@@ -1555,6 +1824,13 @@ def analyze_ticker():
             print(f"✓ Reddit sentiment analyzed ({reddit_data['analyzed_posts']} posts)")
         except Exception as e:
             print(f"⚠ Reddit scraping failed: {e}")
+            log_event(
+                'warning',
+                'REDDIT',
+                'Reddit sentiment fetch failed',
+                action='reddit_failed',
+                exception=e
+            )
             reddit_data = {
                 'average_sentiment': 0,
                 'sentiment_percentage': 50,
@@ -1564,6 +1840,13 @@ def analyze_ticker():
         
         # 4. Fetch news articles
         print(f"\n[4/5] Fetching recent news articles...")
+        log_event(
+            'info',
+            'RUN',
+            'Phase 4: news processing',
+            action='phase_start',
+            meta={'phase': 4, 'name': 'news'}
+        )
         news_data = {}
         try:
             if NEWS_API_KEY:
@@ -1577,6 +1860,13 @@ def analyze_ticker():
                 print(f"✓ News analyzed ({news_data['total_articles']} articles)")
             else:
                 print(f"⚠ News API key not configured (optional)")
+                log_event(
+                    'info',
+                    'NEWS',
+                    'NEWS_API_KEY not configured',
+                    source='NewsAPI',
+                    action='news_api_key_missing'
+                )
                 news_data = {
                     'average_sentiment': 0,
                     'sentiment_percentage': 50,
@@ -1586,6 +1876,14 @@ def analyze_ticker():
                 }
         except Exception as e:
             print(f"⚠ News fetching failed: {e}")
+            log_event(
+                'warning',
+                'NEWS',
+                'News fetching failed',
+                source='NewsAPI',
+                action='news_fetch_failed',
+                exception=e
+            )
             news_data = {
                 'average_sentiment': 0,
                 'sentiment_percentage': 50,
@@ -1596,6 +1894,13 @@ def analyze_ticker():
         
         # 5. Calculate DCF valuation
         print(f"\n[5/5] Calculating DCF valuation...")
+        log_event(
+            'info',
+            'RUN',
+            'Phase 5: dcf processing',
+            action='phase_start',
+            meta={'phase': 5, 'name': 'dcf'}
+        )
         default_assumptions = get_default_assumptions(assumptions_hint)
         
         user_assumptions = data.get('assumptions', {})
@@ -1605,8 +1910,22 @@ def analyze_ticker():
             model = DCFModel(company_data, historical_data, assumptions, esg_data=esg_data)
             results = model.calculate_dcf_valuation()
             print(f"✓ DCF calculation completed")
+            log_event(
+                'info',
+                'DCF',
+                'DCF calculation completed',
+                action='dcf_completed'
+            )
         except Exception as e:
             error_msg = f'Error calculating DCF: {str(e)}'
+            log_event(
+                'error',
+                'DCF',
+                error_msg,
+                action='dcf_failed',
+                exception=e,
+                fatal=True
+            )
             print(f"✗ {error_msg}")
             return jsonify({'success': False, 'error': error_msg}), 500
         
@@ -1619,6 +1938,15 @@ def analyze_ticker():
         results['data_quality'] = quality_report
         results['raw_financials'] = raw_financials
         results['esg'] = esg_data
+        results['assumptions_hint'] = assumptions_hint
+        results['data_sources'] = {
+            'company_data': raw_financials.get('source'),
+            'beta': ('Alpha Vantage OVERVIEW' if raw_financials.get('source') == 'Alpha Vantage'
+                     else 'Yahoo Finance (yfinance)' if raw_financials.get('source') else 'Unknown')
+        }
+        results['run_timestamp'] = datetime.utcnow().isoformat() + 'Z'
+        results['run_log'] = get_run_log()
+        results['run_log_summary'] = summarize_run_log()
 
         # Generate Excel report
         excel_file = save_excel_report(ticker, results)
@@ -1709,6 +2037,15 @@ def export_excel():
             results['assumptions'] = assumptions
             results['raw_financials'] = raw_financials
             results['esg'] = esg_data
+        results['assumptions_hint'] = assumptions_hint
+        results['data_sources'] = {
+            'company_data': raw_financials.get('source'),
+            'beta': ('Alpha Vantage OVERVIEW' if raw_financials.get('source') == 'Alpha Vantage'
+                     else 'Yahoo Finance (yfinance)' if raw_financials.get('source') else 'Unknown')
+        }
+        results['run_timestamp'] = datetime.utcnow().isoformat() + 'Z'
+        results['run_log'] = get_run_log()
+        results['run_log_summary'] = summarize_run_log()
 
         buffer = build_workbook_bytes(ticker, results)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")

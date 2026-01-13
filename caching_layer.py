@@ -7,6 +7,12 @@ from datetime import datetime
 from functools import wraps
 import json
 
+try:
+    from run_log import log_event
+except Exception:  # pragma: no cover - optional dependency
+    def log_event(*args, **kwargs):
+        return
+
 _CACHE = {}
 _CACHE_TIMESTAMPS = {}
 
@@ -27,12 +33,32 @@ def cache_response(expire_minutes=1440):
                 age_minutes = (datetime.utcnow() - _CACHE_TIMESTAMPS[cache_key]).total_seconds() / 60
                 if age_minutes < expire_minutes:
                     print(f"  CACHE HIT for {func.__name__} (age: {age_minutes:.1f} min)")
+                    log_event(
+                        "info",
+                        "CACHE",
+                        f"Cache hit for {func.__name__}",
+                        action="cache_hit",
+                        meta={"age_minutes": round(age_minutes, 2)}
+                    )
                     return _CACHE[cache_key]
                 del _CACHE[cache_key]
                 del _CACHE_TIMESTAMPS[cache_key]
                 print(f"  CACHE EXPIRED for {func.__name__} (age: {age_minutes:.1f} min)")
+                log_event(
+                    "info",
+                    "CACHE",
+                    f"Cache expired for {func.__name__}",
+                    action="cache_expired",
+                    meta={"age_minutes": round(age_minutes, 2)}
+                )
             else:
                 print(f"  CACHE MISS for {func.__name__}")
+                log_event(
+                    "info",
+                    "CACHE",
+                    f"Cache miss for {func.__name__}",
+                    action="cache_miss"
+                )
 
             result = func(*args, **kwargs)
             _CACHE[cache_key] = result

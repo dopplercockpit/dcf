@@ -577,6 +577,93 @@
             font-weight: 500;
         }
 
+        .explanation-item {
+            margin: 12px 0;
+            padding: 12px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border: 1px solid #eef2f7;
+        }
+
+        .explanation-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            color: #1e3c72;
+        }
+
+        .info-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #e7f3ff;
+            color: #1e3c72;
+            font-size: 0.75em;
+            cursor: help;
+        }
+
+        .details-panel {
+            margin-top: 8px;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 10px 12px;
+        }
+
+        .details-panel summary {
+            cursor: pointer;
+            font-weight: 600;
+            color: #374151;
+        }
+
+        .details-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 8px 16px;
+            margin-top: 10px;
+            font-size: 0.85em;
+            color: #4b5563;
+        }
+
+        .details-label {
+            font-weight: 600;
+            color: #1f2937;
+        }
+
+        .run-log {
+            margin-top: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .run-log-item {
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+            background: #f9fafb;
+            font-size: 0.85em;
+        }
+
+        .run-log-item.error {
+            border-color: #fecaca;
+            background: #fef2f2;
+        }
+
+        .run-log-item.warning {
+            border-color: #fde68a;
+            background: #fffbeb;
+        }
+
+        .run-log-item .meta {
+            color: #6b7280;
+            font-size: 0.85em;
+        }
+
         /* RESPONSIVE DESIGN */
         @media (max-width: 1200px) {
             .results-layout {
@@ -921,6 +1008,114 @@ ${json}
             }
         }
 
+        function formatDetailValue(value) {
+            if (value === null || value === undefined) return 'N/A';
+            if (typeof value === 'object') {
+                try {
+                    return `<pre style="margin:4px 0;white-space:pre-wrap;">${JSON.stringify(value, null, 2)}</pre>`;
+                } catch (e) {
+                    return String(value);
+                }
+            }
+            return String(value);
+        }
+
+        function renderKeyValues(obj) {
+            if (!obj || typeof obj !== 'object') return '<div>N/A</div>';
+            return Object.entries(obj).map(([key, value]) => (
+                `<div><span class="details-label">${key}:</span> ${formatDetailValue(value)}</div>`
+            )).join('');
+        }
+
+        function renderDetails(details, calculation) {
+            if (!details && !calculation) return '';
+            const formula = details?.formula;
+            const inputs = details?.inputs;
+            const intermediate = details?.intermediate;
+            const provenance = details?.provenance;
+            return `
+                <details class="details-panel">
+                    <summary>Details</summary>
+                    <div class="details-grid">
+                        ${formula ? `<div><div class="details-label">Formula</div>${formatDetailValue(formula)}</div>` : ''}
+                        ${calculation ? `<div><div class="details-label">Calculation</div>${formatDetailValue(calculation)}</div>` : ''}
+                        ${inputs ? `<div><div class="details-label">Inputs</div>${renderKeyValues(inputs)}</div>` : ''}
+                        ${intermediate ? `<div><div class="details-label">Intermediate</div>${renderKeyValues(intermediate)}</div>` : ''}
+                        ${provenance ? `<div><div class="details-label">Provenance</div>${renderKeyValues(provenance)}</div>` : ''}
+                    </div>
+                </details>
+            `;
+        }
+
+        function renderTable(table) {
+            if (!table) return '';
+            const header = table.columns?.length
+                ? `<tr>${table.columns.map(col => `<th>${col}</th>`).join('')}</tr>`
+                : '';
+            const rows = (table.rows || []).map(row => (
+                `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`
+            )).join('');
+            return `
+                <div style="margin-top: 10px;">
+                    ${table.title ? `<h4 style="margin: 10px 0;">${table.title}</h4>` : ''}
+                    <table>${header}${rows}</table>
+                </div>
+            `;
+        }
+
+        function renderRunLog(runLog, summary) {
+            if (!runLog || !runLog.length) {
+                return '<p style="color:#6b7280;">No run log entries.</p>';
+            }
+
+            const groups = { error: [], warning: [], info: [] };
+            runLog.forEach(entry => {
+                const level = entry.level || 'info';
+                if (!groups[level]) groups[level] = [];
+                groups[level].push(entry);
+            });
+
+            const summaryHtml = summary?.counts
+                ? `<p class="meta">Summary: ${JSON.stringify(summary.counts)}</p>`
+                : '';
+
+            const renderEntries = (entries, levelLabel) => {
+                if (!entries.length) return '';
+                return `
+                    <div style="margin-top: 10px;">
+                        <strong>${levelLabel}</strong>
+                        <div class="run-log">
+                            ${entries.map(entry => {
+                                const metaParts = [
+                                    entry.ts ? `Time: ${entry.ts}` : null,
+                                    entry.subsystem ? `Subsystem: ${entry.subsystem}` : null,
+                                    entry.source ? `Source: ${entry.source}` : null,
+                                    entry.code ? `Code: ${entry.code}` : null,
+                                    entry.action ? `Action: ${entry.action}` : null,
+                                ].filter(Boolean);
+                                const meta = metaParts.join(' | ');
+                                const details = entry.meta ? `Meta: ${JSON.stringify(entry.meta)}` : '';
+                                return `
+                                    <div class="run-log-item ${entry.level}">
+                                        <div><strong>${entry.message}</strong></div>
+                                        ${meta ? `<div class="meta">${meta}</div>` : ''}
+                                        ${details ? `<div class="meta">${details}</div>` : ''}
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+                `;
+            };
+
+            return `
+                ${summaryHtml}
+                ${renderEntries(groups.error, 'Errors')}
+                ${renderEntries(groups.warning, 'Warnings')}
+                ${renderEntries(groups.info, 'Info')}
+            `;
+        }
+
         function displayExplanation(explanation) {
             const container = document.getElementById('explanation-container');
             if (!explanation || !explanation.sections) {
@@ -938,18 +1133,34 @@ ${json}
                 if (section.explanation) {
                     html += `<p style="color: #666;">${section.explanation}</p>`;
                 }
+                if (section.tables && section.tables.length) {
+                    section.tables.forEach(table => {
+                        html += renderTable(table);
+                    });
+                }
                 if (section.items && section.items.length) {
                     section.items.forEach(item => {
-                        html += `<div style="margin: 15px 0; padding: 15px; background: #f8f9fa; border-radius: 8px;">`;
-                        html += `<strong>${item.label}:</strong> ${item.value}<br>`;
-                        if (item.calculation) {
-                            html += `<span style="color: #667eea;">- ${item.calculation}</span><br>`;
-                        }
-                        if (item.explanation) {
-                            html += `<span style="color: #666; font-size: 0.9em;">${item.explanation}</span>`;
+                        const tooltip = item.tooltip || item.explanation || '';
+                        html += `<div class="explanation-item">`;
+                        html += `<div class="explanation-header">`;
+                        html += `<span>${item.label}:</span>`;
+                        html += `<span style="font-weight: 700; color:#111827;">${item.value}</span>`;
+                        if (tooltip) {
+                            html += `<span class="info-icon" title="${tooltip}">i</span>`;
                         }
                         html += `</div>`;
+                        if (item.calculation) {
+                            html += `<div style="color: #667eea; margin-top: 4px;">${item.calculation}</div>`;
+                        }
+                        if (item.explanation) {
+                            html += `<div style="color: #6b7280; font-size: 0.9em;">${item.explanation}</div>`;
+                        }
+                        html += renderDetails(item.details, item.calculation);
+                        html += `</div>`;
                     });
+                }
+                if (section.run_log) {
+                    html += renderRunLog(section.run_log, section.summary);
                 }
             });
 
