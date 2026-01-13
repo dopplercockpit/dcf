@@ -546,6 +546,37 @@
             background-color: #f8f9fa;
         }
 
+        .sensitivity-matrix {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0 0;
+            font-size: 0.85em;
+            box-shadow: none;
+        }
+
+        .sensitivity-matrix th,
+        .sensitivity-matrix td {
+            padding: 8px 10px;
+            text-align: center;
+            border: 1px solid #e5e7eb;
+        }
+
+        .sensitivity-matrix th {
+            background: #f1f5f9;
+            color: #0f172a;
+            font-weight: 600;
+        }
+
+        .sensitivity-cell {
+            font-weight: 600;
+            color: #0f172a;
+        }
+
+        .sensitivity-cell.na {
+            color: #9ca3af;
+            font-weight: 500;
+        }
+
         /* RESPONSIVE DESIGN */
         @media (max-width: 1200px) {
             .results-layout {
@@ -1012,6 +1043,64 @@ ${json}
             return `${rounded}x`;
         }
 
+        function getHeatmapColor(value, minValue, maxValue) {
+            if (value === null || value === undefined || !isFinite(value)) {
+                return '#f3f4f6';
+            }
+            if (minValue === null || maxValue === null || minValue === maxValue) {
+                return '#e5e7eb';
+            }
+            const ratio = Math.max(0, Math.min(1, (value - minValue) / (maxValue - minValue)));
+            const start = { r: 254, g: 226, b: 226 };
+            const end = { r: 220, g: 252, b: 231 };
+            const r = Math.round(start.r + (end.r - start.r) * ratio);
+            const g = Math.round(start.g + (end.g - start.g) * ratio);
+            const b = Math.round(start.b + (end.b - start.b) * ratio);
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+
+        function renderSensitivityMatrix(sensitivity) {
+            const matrix = sensitivity.matrix || [];
+            if (!Array.isArray(matrix) || matrix.length === 0) {
+                return '';
+            }
+            const waccRange = sensitivity.wacc_range || [];
+            const growthRange = sensitivity.growth_range || [];
+            const rowLabels = waccRange.length === matrix.length
+                ? waccRange.map(value => `${(value * 100).toFixed(2)}%`)
+                : matrix.map((_, i) => `Row ${i + 1}`);
+            const colLabels = growthRange.length === (matrix[0] || []).length
+                ? growthRange.map(value => `${(value * 100).toFixed(2)}%`)
+                : (matrix[0] || []).map((_, i) => `Col ${i + 1}`);
+
+            let html = `
+                <div class="section">
+                    <h2 class="section-title">Sensitivity Analysis: WACC vs Terminal Growth</h2>
+                    <p style="font-size: 0.85em; color: #6b7280;">
+                        Values are intrinsic value per share under different discount rates and terminal growth assumptions.
+                    </p>
+                    <table class="sensitivity-matrix">
+                        <tr>
+                            <th>WACC \\ Growth</th>
+                            ${colLabels.map(label => `<th>${label}</th>`).join('')}
+                        </tr>
+            `;
+
+            matrix.forEach((row, rowIndex) => {
+                html += `<tr><th>${rowLabels[rowIndex]}</th>`;
+                row.forEach((value) => {
+                    const isValid = value !== null && value !== undefined && isFinite(value);
+                    const bg = getHeatmapColor(value, sensitivity.min_value, sensitivity.max_value);
+                    const display = isValid ? `$${value.toFixed(2)}` : 'N/A';
+                    html += `<td class="sensitivity-cell ${isValid ? '' : 'na'}" style="background: ${bg};">${display}</td>`;
+                });
+                html += '</tr>';
+            });
+
+            html += '</table></div>';
+            return html;
+        }
+
         function formatNumber(value) {
             // Format plain numbers with thousand separators, negatives in red parentheses
             if (value === null || value === undefined || isNaN(value)) return 'N/A';
@@ -1162,6 +1251,16 @@ ${json}
                         ...stressScenarios
                     },
                     ...stress
+                },
+                sensitivity: {
+                    wacc_range: [],
+                    growth_range: [],
+                    matrix: [],
+                    min_value: null,
+                    max_value: null,
+                    base_wacc: 0,
+                    base_growth: 0,
+                    ...(safe.sensitivity || {})
                 }
             };
         }
@@ -1175,9 +1274,26 @@ ${json}
             const details = results.calculation_details || {};
             const esg = results.esg || {};
             const stress = results.stress_test || {};
+            const sensitivity = results.sensitivity || {};
 
             const esgScore = esg.total_esg;
             const hasEsg = esgScore !== null && esgScore !== undefined;
+            const esgMetaParts = [];
+            if (esg.source) {
+                esgMetaParts.push(`Source: ${esg.source}`);
+            }
+            if (typeof esg.is_estimated === 'boolean') {
+                esgMetaParts.push(`Estimated: ${esg.is_estimated ? 'yes' : 'no'}`);
+            }
+            if (esg.confidence) {
+                esgMetaParts.push(`Confidence: ${String(esg.confidence).replace(/_/g, ' ')}`);
+            }
+            const esgMeta = esgMetaParts.length
+                ? `<p style="font-size: 0.85em; color: #6b7280;">${esgMetaParts.join(' | ')}</p>`
+                : '';
+            const esgNote = esg.note
+                ? `<p style="font-size: 0.85em; color: #6b7280;">${esg.note}</p>`
+                : '';
             const esgHtml = hasEsg ? `
                 <div class="section">
                     <h2 class="section-title">Sustainable Finance (ESG)</h2>
@@ -1209,6 +1325,8 @@ ${json}
                             </div>
                         </div>
                     </div>
+                    ${esgMeta}
+                    ${esgNote}
                 </div>
             ` : '';
 
@@ -1254,6 +1372,8 @@ ${json}
                     </div>
                 </div>
             ` : '';
+
+            const sensitivityHtml = renderSensitivityMatrix(sensitivity);
 
             // Determine recommendation
             let recommendation, returnText, arrowHTML, arrowClass;
@@ -1428,6 +1548,7 @@ ${json}
 
                 ${esgHtml}
                 ${stressHtml}
+                ${sensitivityHtml}
 
                 <div class="section">
                     <h2 class="section-title">🔮 Projected Free Cash Flows (5-Year Forecast)</h2>

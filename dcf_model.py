@@ -416,6 +416,8 @@ def fetch_from_yahoo(ticker: str):
     company_data = {
         "ticker": ticker,
         "company_name": info.get("longName") or info.get("shortName") or ticker,
+        "sector": info.get("sector", ""),
+        "industry": info.get("industry", ""),
         "current_stock_price": current_price,
         "shares_outstanding": _to_millions(info.get("sharesOutstanding")),
         "total_debt": _to_millions(info.get("totalDebt")),
@@ -507,62 +509,233 @@ def fetch_from_yahoo(ticker: str):
     return company_data, historical_data, assumptions_hint, raw_financials
 
 
+def _parse_esg_score(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        score = float(value)
+    else:
+        raw = str(value).strip().upper()
+        grade_map = {
+            "A+": 95, "A": 90, "A-": 85,
+            "B+": 80, "B": 75, "B-": 70,
+            "C+": 65, "C": 60, "C-": 55,
+            "D+": 50, "D": 45, "D-": 40,
+            "F": 30
+        }
+        if raw in grade_map:
+            score = grade_map[raw]
+        else:
+            try:
+                score = float(raw)
+            except ValueError:
+                return None
+    return max(0.0, min(100.0, score))
+
+
+class ESGDataFetcher:
+    """Multi-source ESG data fetcher with graceful fallbacks."""
+
+    def __init__(self, fmp_api_key=None):
+        self.fmp_api_key = fmp_api_key
+        self.sector_baselines = {
+            "technology": {"total": 45, "env": 50, "social": 45, "gov": 40},
+            "financial": {"total": 50, "env": 45, "social": 50, "gov": 55},
+            "healthcare": {"total": 48, "env": 40, "social": 55, "gov": 50},
+            "consumer": {"total": 42, "env": 40, "social": 42, "gov": 45},
+            "energy": {"total": 35, "env": 30, "social": 35, "gov": 40},
+            "industrial": {"total": 40, "env": 38, "social": 40, "gov": 42},
+            "default": {"total": 45, "env": 45, "social": 45, "gov": 45}
+        }
+
+    def fetch_esg_data(self, ticker: str, company_name: str = "", sector: str = ""):
+        ticker = ticker.upper().strip()
+
+        fmp_data = self._fetch_from_fmp(ticker)
+        if fmp_data:
+            return fmp_data
+
+        yahoo_data = self._fetch_from_yahoo(ticker)
+        if yahoo_data:
+            return yahoo_data
+
+        estimate = self._estimate_from_news(ticker, company_name)
+        if estimate:
+            return estimate
+
+        return self._sector_baseline(sector)
+
+    def _fetch_from_fmp(self, ticker: str):
+        if not self.fmp_api_key:
+            return None
+
+        try:
+            url = "https://financialmodelingprep.com/api/v4/esg-environmental-social-governance-data"
+            params = {"symbol": ticker, "apikey": self.fmp_api_key}
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code != 200:
+                return None
+
+            data = response.json()
+            if not data or not isinstance(data, list):
+                return None
+
+            latest = data[0]
+            total_esg = _parse_esg_score(latest.get("ESGScore"))
+            environment_score = _parse_esg_score(latest.get("environmentalScore"))
+            social_score = _parse_esg_score(latest.get("socialScore"))
+            governance_score = _parse_esg_score(latest.get("governanceScore"))
+
+            if total_esg is None:
+                return None
+
+            return {
+                "source": "Financial Modeling Prep",
+                "total_esg": total_esg,
+                "environment_score": environment_score,
+                "social_score": social_score,
+                "governance_score": governance_score,
+                "controversy_level": None,
+                "confidence": "high",
+                "is_estimated": False,
+                "last_updated": latest.get("date"),
+                "raw": latest
+            }
+        except Exception:
+            return None
+
+    def _fetch_from_yahoo(self, ticker: str):
+        try:
+            stock = yf.Ticker(ticker)
+            sustainability = stock.sustainability
+            if sustainability is None or sustainability.empty:
+                return None
+
+            def _get_score(key):
+                if key not in sustainability.index or sustainability.empty:
+                    return None
+                try:
+                    col = sustainability.columns[0]
+                    value = sustainability.at[key, col]
+                    return _parse_esg_score(value)
+                except Exception:
+                    return None
+
+            total_esg = _get_score("totalEsg")
+            environment_score = _get_score("environmentScore")
+            social_score = _get_score("socialScore")
+            governance_score = _get_score("governanceScore")
+            controversy_level = _get_score("controversyLevel")
+
+            if total_esg is None:
+                return None
+
+            return {
+                "source": "Yahoo Finance (yfinance)",
+                "total_esg": total_esg,
+                "environment_score": environment_score,
+                "social_score": social_score,
+                "governance_score": governance_score,
+                "controversy_level": controversy_level,
+                "confidence": "medium",
+                "is_estimated": False,
+                "raw": {
+                    "totalEsg": total_esg,
+                    "environmentScore": environment_score,
+                    "socialScore": social_score,
+                    "governanceScore": governance_score,
+                    "controversyLevel": controversy_level
+                }
+            }
+        except Exception:
+            return None
+
+    def _estimate_from_news(self, ticker: str, company_name: str):
+        if not NEWS_API_KEY:
+            return None
+
+        query_name = company_name or ticker
+        analyzer = NewsAnalyzer(NEWS_API_KEY)
+        articles = analyzer.fetch_company_news(query_name, ticker, days=180)
+        if not articles:
+            return None
+
+        esg_keywords = [
+            "sustainability", "carbon neutral", "net zero", "renewable",
+            "green energy", "esg", "diversity", "inclusion", "governance",
+            "ethical", "responsible", "environmental", "climate"
+        ]
+
+        esg_mentions = 0
+        for article in articles:
+            text = (article.get("title", "") + " " + article.get("description", "")).lower()
+            if any(keyword in text for keyword in esg_keywords):
+                esg_mentions += 1
+
+        if esg_mentions > 20:
+            base_score = 65
+            confidence = "medium"
+        elif esg_mentions > 10:
+            base_score = 55
+            confidence = "low"
+        elif esg_mentions > 5:
+            base_score = 45
+            confidence = "low"
+        else:
+            base_score = 35
+            confidence = "very_low"
+
+        return {
+            "source": "News-based estimate",
+            "total_esg": base_score,
+            "environment_score": base_score + 5,
+            "social_score": base_score,
+            "governance_score": base_score - 5,
+            "controversy_level": None,
+            "confidence": confidence,
+            "is_estimated": True,
+            "note": f"Estimated from {esg_mentions} ESG-related news mentions",
+            "raw": {"esg_mentions": esg_mentions}
+        }
+
+    def _sector_baseline(self, sector: str):
+        sector_key = (sector or "").strip().lower()
+        selected = None
+
+        for key, scores in self.sector_baselines.items():
+            if key != "default" and key in sector_key:
+                selected = (key, scores)
+                break
+
+        if selected:
+            key, scores = selected
+            source = f"Sector baseline ({key})"
+        else:
+            scores = self.sector_baselines["default"]
+            source = "Sector baseline (default)"
+
+        return {
+            "source": source,
+            "total_esg": scores["total"],
+            "environment_score": scores["env"],
+            "social_score": scores["social"],
+            "governance_score": scores["gov"],
+            "controversy_level": None,
+            "confidence": "very_low",
+            "is_estimated": True,
+            "note": "Placeholder baseline when no company-specific data is available",
+            "raw": {"sector": sector or ""}
+        }
+
+
 @cache_response(expire_minutes=1440)
-def fetch_esg_data(ticker: str):
+def fetch_esg_data(ticker: str, company_name: str = "", sector: str = ""):
     """
-    Fetch ESG data using yfinance.Ticker(ticker).sustainability.
+    Fetch ESG data using multiple sources with fallbacks.
     Returns a normalized dict and never raises to caller.
     """
-    normalized = {
-        "source": "yfinance",
-        "total_esg": None,
-        "environment_score": None,
-        "social_score": None,
-        "governance_score": None,
-        "controversy_level": None,
-        "raw": {}
-    }
-
-    try:
-        stock = yf.Ticker(ticker.upper().strip())
-        sustainability = stock.sustainability
-        if sustainability is None or sustainability.empty:
-            return normalized
-
-        def _get_score(key):
-            if key not in sustainability.index or sustainability.empty:
-                return None
-            try:
-                col = sustainability.columns[0]
-                value = sustainability.at[key, col]
-                return float(value) if value is not None else None
-            except Exception:
-                return None
-
-        total_esg = _get_score("totalEsg")
-        environment_score = _get_score("environmentScore")
-        social_score = _get_score("socialScore")
-        governance_score = _get_score("governanceScore")
-        controversy_level = _get_score("controversyLevel")
-
-        normalized.update({
-            "total_esg": total_esg,
-            "environment_score": environment_score,
-            "social_score": social_score,
-            "governance_score": governance_score,
-            "controversy_level": controversy_level,
-            "raw": {
-                "totalEsg": total_esg,
-                "environmentScore": environment_score,
-                "socialScore": social_score,
-                "governanceScore": governance_score,
-                "controversyLevel": controversy_level
-            }
-        })
-    except Exception as e:
-        normalized["raw"] = {"error": str(e)}
-
-    return normalized
+    fetcher = ESGDataFetcher(fmp_api_key=os.environ.get("FMP_API_KEY"))
+    return fetcher.fetch_esg_data(ticker, company_name=company_name, sector=sector)
 
 
 @cache_response(expire_minutes=1440)
@@ -669,6 +842,8 @@ def fetch_company_and_cashflows(ticker: str):
     company_data = {
         "ticker": ticker,
         "company_name": overview.get("Name", ticker),
+        "sector": overview.get("Sector", ""),
+        "industry": overview.get("Industry", ""),
         "current_stock_price": current_price,
         "shares_outstanding": _to_millions(overview.get("SharesOutstanding")),
         "total_debt": total_debt,
@@ -956,6 +1131,68 @@ class DCFModel:
         }
         
         return terminal_value
+
+    def _calc_intrinsic_for_sensitivity(self, projected_fcf, wacc, growth):
+        if not projected_fcf or wacc <= 0 or wacc <= growth:
+            return None
+
+        pv_fcf = 0.0
+        for year, fcf in enumerate(projected_fcf, 1):
+            pv_fcf += fcf / ((1 + wacc) ** year)
+
+        terminal_value = (projected_fcf[-1] * (1 + growth)) / (wacc - growth)
+        pv_terminal = terminal_value / ((1 + wacc) ** len(projected_fcf))
+
+        enterprise_value = pv_fcf + pv_terminal
+        equity_value = enterprise_value - self.company['total_debt'] + self.company['cash']
+        shares = self.company['shares_outstanding']
+        if shares <= 0:
+            return None
+
+        return equity_value / shares
+
+    def calculate_sensitivity_matrix(self, projected_fcf, base_wacc):
+        """Calculate sensitivity matrix for WACC and terminal growth."""
+        if not projected_fcf or base_wacc <= 0:
+            return {}
+
+        base_growth = self.assumptions.get("perpetual_growth_rate", 0.0)
+        wacc_range = [
+            base_wacc * 0.75,
+            base_wacc * 0.9,
+            base_wacc,
+            base_wacc * 1.1,
+            base_wacc * 1.25
+        ]
+        growth_range = [
+            base_growth - 0.01,
+            base_growth - 0.005,
+            base_growth,
+            base_growth + 0.005,
+            base_growth + 0.01
+        ]
+
+        matrix = []
+        for wacc in wacc_range:
+            row = []
+            for growth in growth_range:
+                value = self._calc_intrinsic_for_sensitivity(projected_fcf, wacc, growth)
+                row.append(value)
+            matrix.append(row)
+
+        valid_values = [value for row in matrix for value in row if value is not None]
+        min_value = min(valid_values) if valid_values else None
+        max_value = max(valid_values) if valid_values else None
+
+        return {
+            "wacc_range": wacc_range,
+            "growth_range": growth_range,
+            "matrix": matrix,
+            "base_wacc": base_wacc,
+            "base_growth": base_growth,
+            "min_value": min_value,
+            "max_value": max_value
+        }
     
     def calculate_dcf_valuation(self):
         """Perform complete DCF valuation."""
@@ -1037,6 +1274,8 @@ class DCFModel:
             "carbon_costs": carbon_costs if carbon_tax_enabled else [],
             "notes": stress_notes
         }
+
+        sensitivity = self.calculate_sensitivity_matrix(projected_fcf, wacc)
         
         results = {
             'wacc_results': wacc_results,
@@ -1053,6 +1292,7 @@ class DCFModel:
             'irr': irr,
             'ev_fcf_multiple': ev_fcf_multiple,
             'stress_test': stress_test,
+            'sensitivity': sensitivity,
             'calculation_details': self.calculation_details
         }
         
@@ -1299,7 +1539,11 @@ def analyze_ticker():
 
         # Fetch ESG data
         print(f"\n[2/5] Fetching ESG data...")
-        esg_data = fetch_esg_data(ticker)
+        esg_data = fetch_esg_data(
+            ticker,
+            company_name=company_data.get("company_name", ""),
+            sector=company_data.get("sector", "")
+        )
         
         # 3. Scrape Reddit sentiment
         print(f"\n[3/5] Scraping Reddit for community sentiment...")
@@ -1451,7 +1695,11 @@ def export_excel():
 
             user_assumptions = data.get('assumptions', {})
             company_data, historical_data, assumptions_hint, raw_financials = fetch_company_and_cashflows(ticker)
-            esg_data = fetch_esg_data(ticker)
+            esg_data = fetch_esg_data(
+                ticker,
+                company_name=company_data.get("company_name", ""),
+                sector=company_data.get("sector", "")
+            )
             assumptions = {**get_default_assumptions(assumptions_hint), **user_assumptions}
 
             model = DCFModel(company_data, historical_data, assumptions, esg_data=esg_data)
