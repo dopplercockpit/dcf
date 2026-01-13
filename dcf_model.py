@@ -9,15 +9,19 @@ from flask_cors import CORS
 import json
 from datetime import datetime, timedelta
 import os
+import sys
 import requests
 from dotenv import load_dotenv
 import re
 from collections import Counter
 import yfinance as yf
+from werkzeug.exceptions import HTTPException
 from excel_exporter import save_excel_report
 from excel_export import build_workbook_bytes
-from db import init_db, get_session
+from caching_layer import cache_response
+from db import init_db, get_session, check_db_health
 from models import ValuationRun
+from show_your_work import generate_calculation_walkthrough
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +30,9 @@ app = Flask(__name__)
 CORS(app)
 
 init_db()
+
+APP_START_TIME = datetime.utcnow()
+REQUEST_COUNTER = {"total": 0, "errors": 0}
 
 # API Configuration
 ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY")
@@ -254,7 +261,7 @@ class NewsAnalyzer:
         """Fetch recent news articles about the company."""
         if not self.api_key:
             return []
-        
+
         try:
             to_date = datetime.now()
             from_date = to_date - timedelta(days=days)
@@ -274,15 +281,25 @@ class NewsAnalyzer:
             if response.status_code == 200:
                 data = response.json()
                 articles = data.get('articles', [])
-                
-                return [{
-                    'title': article['title'],
-                    'description': article.get('description', ''),
-                    'url': article['url'],
-                    'source': article['source']['name'],
-                    'published_at': article['publishedAt'],
-                    'content': article.get('content', '')
-                } for article in articles]
+                normalized_articles = []
+                for article in articles:
+                    source = article.get('source') or {}
+                    normalized_articles.append({
+                        'title': article.get('title') or '',
+                        'description': article.get('description') or '',
+                        'url': article.get('url') or '',
+                        'source': source.get('name') or 'Unknown',
+                        'published_at': article.get('publishedAt') or '',
+                        'content': article.get('content') or ''
+                    })
+
+                return normalized_articles
+            try:
+                error_payload = response.json()
+                error_message = error_payload.get("message", response.text)
+            except ValueError:
+                error_message = response.text
+            print(f"Error fetching news: {response.status_code} {error_message}")
             
         except Exception as e:
             print(f"Error fetching news: {e}")
@@ -311,7 +328,9 @@ class NewsAnalyzer:
         opportunity_flags = []
         
         for article in articles:
-            text = (article['title'] + ' ' + article.get('description', '')).lower()
+            title = article.get('title') or ''
+            description = article.get('description') or ''
+            text = (title + ' ' + description).lower()
             
             pos_count = sum(1 for word in positive_keywords if word in text)
             neg_count = sum(1 for word in negative_keywords if word in text)
@@ -322,18 +341,18 @@ class NewsAnalyzer:
                 
                 if neg_count >= 2:
                     risk_flags.append({
-                        'title': article['title'][:100],
-                        'source': article['source'],
-                        'url': article['url'],
-                        'date': article['published_at']
+                        'title': title[:100],
+                        'source': article.get('source') or 'Unknown',
+                        'url': article.get('url') or '',
+                        'date': article.get('published_at') or ''
                     })
                 
                 if pos_count >= 2:
                     opportunity_flags.append({
-                        'title': article['title'][:100],
-                        'source': article['source'],
-                        'url': article['url'],
-                        'date': article['published_at']
+                        'title': title[:100],
+                        'source': article.get('source') or 'Unknown',
+                        'url': article.get('url') or '',
+                        'date': article.get('published_at') or ''
                     })
         
         avg_sentiment = sum(sentiment_scores) / len(sentiment_scores) if sentiment_scores else 0
@@ -370,6 +389,7 @@ def _call_alpha_vantage(params: dict):
     return data
 
 
+@cache_response(expire_minutes=1440)
 def fetch_from_yahoo(ticker: str):
     """
     Fallback: Fetch company data from Yahoo Finance using yfinance.
@@ -420,7 +440,10 @@ def fetch_from_yahoo(ticker: str):
             net_income = []
 
             for col in cf.columns:
-                quarters.append(col.strftime('%Y-%m-%d'))
+                if hasattr(col, "strftime"):
+                    quarters.append(col.strftime('%Y-%m-%d'))
+                else:
+                    quarters.append(str(col))
 
                 # Operating cash flow
                 ocf = 0.0
@@ -434,7 +457,9 @@ def fetch_from_yahoo(ticker: str):
                 capex_val = 0.0
                 for key in ['Capital Expenditure', 'Capital Expenditures']:
                     if key in cf.index:
-                        capex_val = abs(_to_millions(cf.loc[key, col]))
+                        capex_val = _to_millions(cf.loc[key, col])
+                        if capex_val:
+                            capex_val = -abs(capex_val)
                         break
                 capex.append(capex_val)
 
@@ -482,6 +507,7 @@ def fetch_from_yahoo(ticker: str):
     return company_data, historical_data, assumptions_hint, raw_financials
 
 
+@cache_response(expire_minutes=1440)
 def fetch_esg_data(ticker: str):
     """
     Fetch ESG data using yfinance.Ticker(ticker).sustainability.
@@ -539,6 +565,7 @@ def fetch_esg_data(ticker: str):
     return normalized
 
 
+@cache_response(expire_minutes=1440)
 def fetch_company_and_cashflows(ticker: str):
     """
     Fetch company snapshot + cash flows + BALANCE SHEET data.
@@ -1097,12 +1124,123 @@ def get_default_assumptions(assumptions_hint=None):
     }
 
 
+@app.before_request
+def track_requests():
+    """Track request count for monitoring."""
+    REQUEST_COUNTER["total"] += 1
+
+
+@app.errorhandler(Exception)
+def handle_exception(error):
+    """Return a user-friendly error without masking HTTP exceptions."""
+    if isinstance(error, HTTPException):
+        return error
+    REQUEST_COUNTER["errors"] += 1
+    print(f"Unhandled error: {error}")
+    return jsonify({
+        "success": False,
+        "error": "An unexpected error occurred. Please try again."
+    }), 500
+
+
 # --- FLASK ROUTES ---
 
 @app.route('/')
 def index():
     """Render main page"""
     return render_template('index_input.html')
+
+
+@app.route('/api/health')
+def health_check():
+    """Health check endpoint for monitoring services."""
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "uptime_seconds": int((datetime.utcnow() - APP_START_TIME).total_seconds()),
+        "checks": {}
+    }
+
+    overall_healthy = True
+
+    api_key_configured = bool(ALPHAVANTAGE_API_KEY)
+    health_status["checks"]["alpha_vantage_api"] = {
+        "status": "configured" if api_key_configured else "missing",
+        "critical": True
+    }
+    if not api_key_configured:
+        overall_healthy = False
+
+    try:
+        db_healthy, db_message = check_db_health()
+        health_status["checks"]["database"] = {
+            "status": "healthy" if db_healthy else "unhealthy",
+            "message": db_message,
+            "critical": True
+        }
+        if not db_healthy:
+            overall_healthy = False
+    except Exception as exc:
+        health_status["checks"]["database"] = {
+            "status": "error",
+            "message": str(exc),
+            "critical": True
+        }
+        overall_healthy = False
+
+    health_status["checks"]["news_api"] = {
+        "status": "configured" if NEWS_API_KEY else "optional_missing",
+        "critical": False
+    }
+
+    health_status["system"] = {
+        "python_version": sys.version.split()[0],
+        "environment": os.environ.get("FLASK_ENV", "development"),
+        "hostname": os.environ.get("RENDER_SERVICE_NAME", "local"),
+        "requests_served": REQUEST_COUNTER["total"],
+        "errors_encountered": REQUEST_COUNTER["errors"],
+    }
+
+    if not overall_healthy:
+        health_status["status"] = "unhealthy"
+        return jsonify(health_status), 503
+
+    return jsonify(health_status), 200
+
+
+@app.route('/api/status')
+def system_status():
+    """Detailed system status endpoint (optional)."""
+    try:
+        import psutil  # Optional dependency
+    except ImportError:
+        return jsonify({
+            "error": "psutil is not installed",
+            "message": "Install psutil to enable system metrics."
+        }), 501
+
+    try:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage(os.getcwd())
+
+        status = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "uptime_seconds": int((datetime.utcnow() - APP_START_TIME).total_seconds()),
+            "system": {
+                "cpu_percent": cpu_percent,
+                "memory_percent": memory.percent,
+                "memory_available_mb": memory.available / (1024 * 1024),
+                "disk_percent": disk.percent
+            },
+            "application": {
+                "requests_served": REQUEST_COUNTER["total"],
+                "errors_encountered": REQUEST_COUNTER["errors"]
+            }
+        }
+        return jsonify(status), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze_ticker():
@@ -1199,6 +1337,7 @@ def analyze_ticker():
                     'average_sentiment': 0,
                     'sentiment_percentage': 50,
                     'total_articles': 0,
+                    'analyzed_articles': 0,
                     'message': 'News API key not configured'
                 }
         except Exception as e:
@@ -1207,6 +1346,7 @@ def analyze_ticker():
                 'average_sentiment': 0,
                 'sentiment_percentage': 50,
                 'total_articles': 0,
+                'analyzed_articles': 0,
                 'error': str(e)
             }
         
@@ -1275,6 +1415,24 @@ def get_defaults():
         }
     }
     return jsonify(defaults)
+
+
+@app.route('/api/explain', methods=['POST'])
+def explain_calculation():
+    """Return step-by-step explanation of the DCF calculation."""
+    data = request.json or {}
+    results = data.get('results')
+    if not results:
+        return jsonify({'success': False, 'error': 'Results payload is required'}), 400
+
+    explanation = generate_calculation_walkthrough(results)
+    return jsonify({'success': True, 'explanation': explanation})
+
+
+@app.route('/api/walkthrough', methods=['POST'])
+def walkthrough_calculation():
+    """Alias for /api/explain."""
+    return explain_calculation()
 
 
 @app.route('/api/export_excel', methods=['POST'])

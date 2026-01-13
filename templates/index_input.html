@@ -61,6 +61,7 @@
             border-radius: 8px;
             margin-bottom: 20px;
             display: none;
+            cursor: pointer;
         }
 
         .alert.error {
@@ -711,6 +712,7 @@
                     <!-- Main Results -->
                     <div class="main-results">
                         <div id="results-container"></div>
+                        <div id="explanation-container"></div>
                     </div>
 
                     <!-- Sidebar with Sentiment Feed -->
@@ -723,6 +725,9 @@
                 </div>
 
                 <div style="text-align: center; margin-top: 30px;">
+                    <button class="button" onclick="showExplanation()" style="width: auto; padding: 15px 40px; margin-right: 10px;">
+                        Show Step-by-Step Explanation
+                    </button>
                     <button class="button" onclick="downloadExcel()" style="width: auto; padding: 15px 40px; margin-right: 10px;">
                         Download Excel
                     </button>
@@ -739,9 +744,15 @@
             const alert = document.getElementById('alert');
             alert.textContent = message;
             alert.className = 'alert ' + type + ' active';
-            setTimeout(() => {
-                alert.classList.remove('active');
-            }, 5000);
+            alert.title = 'Click to dismiss';
+            alert.onclick = () => alert.classList.remove('active');
+
+            const timeoutMs = type === 'error' ? 0 : 5000;
+            if (timeoutMs > 0) {
+                setTimeout(() => {
+                    alert.classList.remove('active');
+                }, timeoutMs);
+            }
         }
 
         let latestResults = null;
@@ -807,8 +818,14 @@
 
                 if (data.success) {
                     latestResults = data.results;
-                    displayResults(data.results);
-                    displaySentimentFeed(data.results);
+                    try {
+                        displayResults(data.results);
+                        displaySentimentFeed(data.results);
+                    } catch (renderError) {
+                        console.error('Render error:', renderError);
+                        showAlert('Error rendering results: ' + renderError.message);
+                        displayRawResults(data.results);
+                    }
                     document.getElementById('results-section').classList.add('active');
                 } else {
                     showAlert('Error: ' + (data.error || 'Unknown error'));
@@ -829,7 +846,102 @@
             document.getElementById('input-section').style.display = 'block';
             document.getElementById('ticker').value = '';
             document.getElementById('ticker').focus();
+            document.getElementById('explanation-container').innerHTML = '';
             latestResults = null;
+        }
+
+        function displayRawResults(results) {
+            const container = document.getElementById('results-container');
+            const explanation = document.getElementById('explanation-container');
+            explanation.innerHTML = '';
+
+            const json = JSON.stringify(results, null, 2);
+            container.innerHTML = `
+                <div class="section">
+                    <h2 class="section-title">Raw Results (Fallback)</h2>
+                    <pre style="background:#0f172a;color:#e2e8f0;padding:20px;border-radius:12px;overflow:auto;max-height:60vh;">
+${json}
+                    </pre>
+                </div>
+            `;
+        }
+
+        async function showExplanation() {
+            if (!latestResults) {
+                showAlert('Run an analysis first.');
+                return;
+            }
+
+            try {
+                const response = await fetch(apiUrl('/api/explain'), {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({results: latestResults})
+                });
+                const data = await response.json();
+
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || 'Failed to generate explanation');
+                }
+
+                displayExplanation(data.explanation);
+            } catch (error) {
+                showAlert('Error generating explanation: ' + error.message);
+            }
+        }
+
+        function displayExplanation(explanation) {
+            const container = document.getElementById('explanation-container');
+            if (!explanation || !explanation.sections) {
+                container.innerHTML = '';
+                return;
+            }
+
+            let html = '<div class="section"><h2 class="section-title">Step-by-Step Calculation Walkthrough</h2>';
+
+            explanation.sections.forEach(section => {
+                html += `<h3 style="color: #1e3c72; margin: 20px 0 10px;">${section.title}</h3>`;
+                if (section.formula) {
+                    html += `<div style="background: #e7f3ff; padding: 10px; border-radius: 8px; margin: 10px 0; font-family: monospace;">${section.formula}</div>`;
+                }
+                if (section.explanation) {
+                    html += `<p style="color: #666;">${section.explanation}</p>`;
+                }
+                if (section.items && section.items.length) {
+                    section.items.forEach(item => {
+                        html += `<div style="margin: 15px 0; padding: 15px; background: #f8f9fa; border-radius: 8px;">`;
+                        html += `<strong>${item.label}:</strong> ${item.value}<br>`;
+                        if (item.calculation) {
+                            html += `<span style="color: #667eea;">- ${item.calculation}</span><br>`;
+                        }
+                        if (item.explanation) {
+                            html += `<span style="color: #666; font-size: 0.9em;">${item.explanation}</span>`;
+                        }
+                        html += `</div>`;
+                    });
+                }
+            });
+
+            if (explanation.key_assumptions) {
+                html += '<h3 style="color: #1e3c72; margin: 20px 0 10px;">Key Assumptions</h3>';
+                html += '<div style="margin: 15px 0; padding: 15px; background: #f8f9fa; border-radius: 8px;">';
+                Object.entries(explanation.key_assumptions).forEach(([key, value]) => {
+                    html += `<div><strong>${key}:</strong> ${value}</div>`;
+                });
+                html += '</div>';
+            }
+
+            if (explanation.final_verdict) {
+                html += '<div class="info-box">';
+                html += `<p><strong>Intrinsic Value:</strong> ${explanation.final_verdict.intrinsic_value}</p>`;
+                html += `<p><strong>Market Price:</strong> ${explanation.final_verdict.market_price}</p>`;
+                html += `<p><strong>Upside:</strong> ${explanation.final_verdict.upside}</p>`;
+                html += `<p><strong>Recommendation:</strong> ${explanation.final_verdict.recommendation}</p>`;
+                html += '</div>';
+            }
+
+            html += '</div>';
+            container.innerHTML = html;
         }
 
         async function downloadExcel() {
@@ -996,8 +1108,68 @@
             `;
         }
 
+        function normalizeResults(rawResults) {
+            const safe = rawResults || {};
+            const stress = safe.stress_test || {};
+            const stressScenarios = stress.scenarios || {};
+
+            return {
+                ...safe,
+                current_market_value: Number(safe.current_market_value || 0),
+                intrinsic_value_per_share: Number(safe.intrinsic_value_per_share || 0),
+                upside_pct: Number(safe.upside_pct || 0),
+                irr: Number(safe.irr || 0),
+                enterprise_value_dcf: Number(safe.enterprise_value_dcf || 0),
+                equity_value: Number(safe.equity_value || 0),
+                terminal_value: Number(safe.terminal_value || 0),
+                pv_terminal_value: Number(safe.pv_terminal_value || 0),
+                projected_fcf: Array.isArray(safe.projected_fcf) ? safe.projected_fcf : [],
+                pv_fcf: Array.isArray(safe.pv_fcf) ? safe.pv_fcf : [],
+                company_data: safe.company_data || {},
+                historical_data: {
+                    quarters: [],
+                    operating_cash_flow: [],
+                    capex: [],
+                    net_income: [],
+                    ...(safe.historical_data || {})
+                },
+                historical_metrics: {
+                    quarterly_fcf: [],
+                    ttm_operating_cf: 0,
+                    ttm_capex: 0,
+                    ttm_fcf: 0,
+                    ttm_net_income: 0,
+                    ...(safe.historical_metrics || {})
+                },
+                wacc_results: {
+                    wacc: 0,
+                    cost_of_equity: 0,
+                    ke_before_esg: 0,
+                    ke_after_esg: 0,
+                    market_cap: 0,
+                    ...(safe.wacc_results || {})
+                },
+                assumptions: {
+                    revenue_growth_rates: [],
+                    perpetual_growth_rate: 0,
+                    ...(safe.assumptions || {})
+                },
+                stress_test: {
+                    enabled: false,
+                    scenarios: {
+                        supply_chain_shock: false,
+                        carbon_tax: false,
+                        ...stressScenarios
+                    },
+                    ...stress
+                }
+            };
+        }
+
         function displayResults(results) {
+            results = normalizeResults(results);
             const container = document.getElementById('results-container');
+            document.getElementById('explanation-container').innerHTML = '';
             const company = results.company_data;
             const upside = results.upside_pct;
             const details = results.calculation_details || {};

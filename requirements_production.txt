@@ -1,0 +1,27 @@
+# Core Dependencies
+Flask>=2.3
+flask-cors>=4.0
+requests>=2.31
+python-dotenv>=1.0
+yfinance>=0.2
+openpyxl>=3.1
+sqlalchemy>=2.0
+
+# Production Server
+gunicorn>=21.2
+
+# PostgreSQL Support
+psycopg2-binary>=2.9
+
+# Caching (optional but recommended)
+# redis>=5.0
+# flask-caching>=2.1
+
+# Monitoring & Error Tracking (optional)
+# sentry-sdk[flask]>=1.40
+
+# Rate Limiting
+# flask-limiter>=3.5
+
+# Environment & Configuration
+python-decouple>=3.8
